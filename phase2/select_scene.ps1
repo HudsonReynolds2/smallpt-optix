@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScenesDir   = Join-Path $ScriptDir "scenes"
-$ActiveScene = Join-Path $ScriptDir "scene.h"
+$ActiveScene = Join-Path $ScriptDir "src\scene.h"
 $BuildDir    = Join-Path $ScriptDir "build"
 
 # List available scenes if no argument was provided

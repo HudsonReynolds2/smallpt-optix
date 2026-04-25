@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 
 #include "shared.h"
-#include "scene.h"   // wall + sphere geometry, NUM_TRIANGLES / NUM_SPHERES / NUM_HG_RECORDS
+#include "scene.h"   // wall + sphere geometry, NUM_WALLS / NUM_SPHERES / NUM_HG_RECORDS, build_wall_geometry()
 
 #include <cassert>
 #include <cmath>
@@ -145,43 +145,46 @@ int main(int argc, char* argv[]) {
         }
 
         // =======================================================================
-        // Build triangle GAS for the 6 walls (12 triangles).
-        // Each triangle gets its own SBT record so it can carry its wall material.
+        // Build triangle GAS for the 6 walls (tessellated).
+        // Each wall is split into a grid of small triangles to avoid float32
+        // precision loss in the closest-hit race against the protruding light
+        // sphere (see scene_default.h for full discussion). Triangles share
+        // SBT records by wall: NUM_WALLS hit group records cover the whole mesh.
         // =======================================================================
         OptixTraversableHandle tri_gas_handle = 0;
         CUdeviceptr            d_tri_gas_output = 0;
         {
-            // Flatten quads -> triangles (no index buffer; each triangle stores 3 unique verts).
-            // 12 triangles * 3 verts = 36 vertices.
-            std::vector<float3> verts;
-            verts.reserve(NUM_TRIANGLES * 3);
-            for (int w = 0; w < NUM_WALLS; ++w) {
-                const WallDef& q = g_walls[w];
-                // Split along the v1-v3 diagonal so both triangles have a
-                // consistent CCW winding for every wall orientation.
-                // The old v0-v2 diagonal produced a non-axis-aligned cross
-                // product on the ceiling quad (and potentially others), giving
-                // a ~45-degree face normal and the visible seam artifact.
-                // Triangle 0: v0, v1, v3
-                verts.push_back(q.v0); verts.push_back(q.v1); verts.push_back(q.v3);
-                // Triangle 1: v1, v2, v3
-                verts.push_back(q.v1); verts.push_back(q.v2); verts.push_back(q.v3);
-            }
+            // Tessellate every wall into a grid of small triangles. See
+            // scene_default.h for the why -- short version: a primary ray
+            // grazing the ceiling near the protruding light sphere needs a
+            // closest-hit comparison whose float32 t-error is much smaller
+            // than the sphere's 0.27-unit protrusion. A single 100x170 unit
+            // ceiling triangle lost that race; ~6-unit cells win it cleanly.
+            //
+            // build_wall_geometry returns:
+            //   verts:        flat vertex array (3 per triangle, no index buffer)
+            //   tri_wall_idx: parallel array, one entry per triangle giving
+            //                 its wall index in 0..NUM_WALLS-1. We feed this
+            //                 directly to OptiX as the SBT index offset, so
+            //                 every triangle of wall N points at hit group
+            //                 record N (one record per wall, not per triangle).
+            std::vector<float3>   verts;
+            std::vector<uint32_t> tri_wall_idx;
+            build_wall_geometry(WALL_TESS_N, verts, tri_wall_idx);
+            const uint32_t num_triangles = (uint32_t)tri_wall_idx.size();
 
             CUdeviceptr d_verts;
             CUDA_CHECK(cudaMalloc((void**)&d_verts, verts.size() * sizeof(float3)));
             CUDA_CHECK(cudaMemcpy((void*)d_verts, verts.data(),
                                   verts.size() * sizeof(float3), cudaMemcpyHostToDevice));
 
-            // SBT index per triangle: 0..NUM_TRIANGLES-1 (one record per triangle)
-            std::vector<uint32_t> tri_sbt_indices(NUM_TRIANGLES);
-            for (int i = 0; i < NUM_TRIANGLES; ++i) tri_sbt_indices[i] = i;
             CUdeviceptr d_tri_sbt_indices;
-            CUDA_CHECK(cudaMalloc((void**)&d_tri_sbt_indices, NUM_TRIANGLES * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMemcpy((void*)d_tri_sbt_indices, tri_sbt_indices.data(),
-                                  NUM_TRIANGLES * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMalloc((void**)&d_tri_sbt_indices, num_triangles * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy((void*)d_tri_sbt_indices, tri_wall_idx.data(),
+                                  num_triangles * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-            std::vector<uint32_t> tri_flags(NUM_TRIANGLES, OPTIX_GEOMETRY_FLAG_NONE);
+            // One flag entry per SBT record (= per wall).
+            std::vector<uint32_t> tri_flags(NUM_WALLS, OPTIX_GEOMETRY_FLAG_NONE);
 
             OptixBuildInput tri_input = {};
             tri_input.type                            = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
@@ -189,10 +192,13 @@ int main(int argc, char* argv[]) {
             tri_input.triangleArray.numVertices       = (uint32_t)verts.size();
             tri_input.triangleArray.vertexBuffers     = &d_verts;
             tri_input.triangleArray.flags             = tri_flags.data();
-            tri_input.triangleArray.numSbtRecords     = NUM_TRIANGLES;
+            tri_input.triangleArray.numSbtRecords     = NUM_WALLS;
             tri_input.triangleArray.sbtIndexOffsetBuffer        = d_tri_sbt_indices;
             tri_input.triangleArray.sbtIndexOffsetSizeInBytes   = sizeof(uint32_t);
             tri_input.triangleArray.sbtIndexOffsetStrideInBytes = sizeof(uint32_t);
+
+            printf("Wall tessellation: %d walls, %u triangles total (NxN=%d, %d tris/wall)\n",
+                   NUM_WALLS, num_triangles, WALL_TESS_N, triangles_per_wall(WALL_TESS_N));
 
             OptixAccelBuildOptions accel_opts = {};
             accel_opts.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION
@@ -316,7 +322,7 @@ int main(int argc, char* argv[]) {
 
         // =======================================================================
         // Build IAS containing two instances: triangle GAS + sphere GAS.
-        // sbtOffset puts triangles in records 0..11 and spheres in records 12..14.
+        // sbtOffset puts walls in records 0..NUM_WALLS-1 and spheres after.
         // =======================================================================
         OptixTraversableHandle ias_handle = 0;
         CUdeviceptr            d_ias_output = 0;
@@ -331,7 +337,7 @@ int main(int argc, char* argv[]) {
 
             OptixInstance instances[2] = {};
 
-            // Triangle instance: SBT records 0..11
+            // Triangle instance: SBT records 0..NUM_WALLS-1 (one per wall)
             std::memcpy(instances[0].transform, identity, sizeof(identity));
             instances[0].instanceId        = 0;
             instances[0].sbtOffset         = 0;
@@ -339,10 +345,10 @@ int main(int argc, char* argv[]) {
             instances[0].flags             = OPTIX_INSTANCE_FLAG_NONE;
             instances[0].traversableHandle = tri_gas_handle;
 
-            // Sphere instance: SBT records starting at NUM_TRIANGLES (=12)
+            // Sphere instance: SBT records starting at NUM_WALLS
             std::memcpy(instances[1].transform, identity, sizeof(identity));
             instances[1].instanceId        = 1;
-            instances[1].sbtOffset         = NUM_TRIANGLES;
+            instances[1].sbtOffset         = NUM_WALLS;
             instances[1].visibilityMask    = 1;
             instances[1].flags             = OPTIX_INSTANCE_FLAG_NONE;
             instances[1].traversableHandle = sph_gas_handle;
@@ -490,8 +496,10 @@ int main(int argc, char* argv[]) {
 
         // -----------------------------------------------------------------------
         // Build SBT.
-        // Layout: [tri records 0..NUM_TRIANGLES-1] [sphere records 0..NUM_SPHERES-1]
-        // The triangle instance has sbtOffset=0; sphere instance has sbtOffset=NUM_TRIANGLES.
+        // Layout: [wall records 0..NUM_WALLS-1] [sphere records 0..NUM_SPHERES-1]
+        // The triangle instance has sbtOffset=0; sphere instance has sbtOffset=NUM_WALLS.
+        // Every triangle of wall N points at hit group record N via the
+        // sbtIndexOffsetBuffer set up during GAS build.
         // -----------------------------------------------------------------------
         OptixShaderBindingTable sbt = {};
         CUdeviceptr d_rg_record, d_ms_record, d_hg_records;
@@ -509,19 +517,19 @@ int main(int argc, char* argv[]) {
             CUDA_CHECK(cudaMalloc((void**)&d_ms_record, sizeof(MissSbtRecord)));
             CUDA_CHECK(cudaMemcpy((void*)d_ms_record, &ms_rec, sizeof(MissSbtRecord), cudaMemcpyHostToDevice));
 
-            // Hit groups: triangles first, then spheres
+            // Hit groups: one record per wall (shared by all that wall's
+            // tessellated triangles), then one per sphere.
             std::vector<HitGroupSbtRecord> hg_recs(NUM_HG_RECORDS);
 
-            for (int t = 0; t < NUM_TRIANGLES; ++t) {
-                OPTIX_CHECK(optixSbtRecordPackHeader(tri_ch_pg, &hg_recs[t]));
-                int wall_idx = t / 2; // 2 triangles per wall
-                hg_recs[t].data.emission = g_walls[wall_idx].emission;
-                hg_recs[t].data.albedo   = g_walls[wall_idx].albedo;
-                hg_recs[t].data.material = g_walls[wall_idx].material;
+            for (int w = 0; w < NUM_WALLS; ++w) {
+                OPTIX_CHECK(optixSbtRecordPackHeader(tri_ch_pg, &hg_recs[w]));
+                hg_recs[w].data.emission = g_walls[w].emission;
+                hg_recs[w].data.albedo   = g_walls[w].albedo;
+                hg_recs[w].data.material = g_walls[w].material;
             }
 
             for (int s = 0; s < NUM_SPHERES; ++s) {
-                int idx = NUM_TRIANGLES + s;
+                int idx = NUM_WALLS + s;
                 OPTIX_CHECK(optixSbtRecordPackHeader(sph_ch_pg, &hg_recs[idx]));
                 hg_recs[idx].data.emission = g_spheres[s].emission;
                 hg_recs[idx].data.albedo   = g_spheres[s].albedo;
