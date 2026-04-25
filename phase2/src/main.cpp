@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include "shared.h"
+#include "scene.h"   // wall + sphere geometry, NUM_TRIANGLES / NUM_SPHERES / NUM_HG_RECORDS
 
 #include <cassert>
 #include <cmath>
@@ -65,84 +66,6 @@ struct SbtRecord {
 typedef SbtRecord<RayGenData>   RayGenSbtRecord;
 typedef SbtRecord<MissData>     MissSbtRecord;
 typedef SbtRecord<HitGroupData> HitGroupSbtRecord;
-
-// ---------------------------------------------------------------------------
-// Cornell box geometry
-//
-// Walls are flat quads (12 triangles total) instead of radius-1e5 spheres.
-// The smallpt 1e5 trick produces float32 precision artifacts in the OptiX 8
-// hardware sphere intersector (visible as banding/tile patterns), so we use
-// real planar geometry.
-//
-// Box bounds derived from smallpt's wall-sphere centers:
-//   left wall:   x = 1
-//   right wall:  x = 99
-//   floor:       y = 0
-//   ceiling:     y = 81.6
-//   back wall:   z = 0
-//   front wall:  z = 170 (behind the camera; black, never visible directly)
-//
-// Spheres kept (small radii, hardware sphere is fine here):
-//   mirror, glass, light
-// ---------------------------------------------------------------------------
-
-struct WallDef {
-    float3       v0, v1, v2, v3; // quad corners (CCW when viewed from inside)
-    float3       emission;
-    float3       albedo;
-    MaterialType material;
-};
-
-// Quad corners are listed so the face normal (cross(v1-v0, v2-v0)) points INTO
-// the room (i.e. towards the camera / scene interior). The closest-hit shader
-// orients its shading hemisphere via dot(N, ray_dir) so the exact orientation
-// doesn't matter for diffuse correctness, but consistent winding keeps things
-// predictable.
-static const WallDef g_walls[] = {
-    // Left wall (x=1), red, normal +x
-    { {1.0f,  0.0f,   0.0f}, {1.0f, 81.6f,   0.0f}, {1.0f, 81.6f, 170.0f}, {1.0f,  0.0f, 170.0f},
-      {0,0,0}, {0.75f, 0.25f, 0.25f}, MAT_DIFFUSE },
-
-    // Right wall (x=99), blue, normal -x
-    { {99.0f, 0.0f, 170.0f}, {99.0f, 81.6f, 170.0f}, {99.0f, 81.6f,   0.0f}, {99.0f,  0.0f,   0.0f},
-      {0,0,0}, {0.25f, 0.25f, 0.75f}, MAT_DIFFUSE },
-
-    // Back wall (z=0), white, normal +z
-    { {99.0f, 0.0f, 0.0f}, {99.0f, 81.6f, 0.0f}, { 1.0f, 81.6f, 0.0f}, { 1.0f,  0.0f, 0.0f},
-      {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
-
-    // Front wall (z=170), black (matches Phase 1's invisible front wall), normal -z
-    { { 1.0f, 0.0f, 170.0f}, { 1.0f, 81.6f, 170.0f}, {99.0f, 81.6f, 170.0f}, {99.0f,  0.0f, 170.0f},
-      {0,0,0}, {0,0,0}, MAT_DIFFUSE },
-
-    // Floor (y=0), white, normal +y (CCW viewed from above the floor)
-    { {1.0f, 0.0f, 170.0f}, {99.0f, 0.0f, 170.0f}, {99.0f, 0.0f,   0.0f}, { 1.0f, 0.0f,   0.0f},
-      {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
-
-    // Ceiling (y=81.6), white, normal -y (CCW viewed from below the ceiling)
-    { { 1.0f, 81.6f,   0.0f}, {99.0f, 81.6f,   0.0f}, {99.0f, 81.6f, 170.0f}, { 1.0f, 81.6f, 170.0f},
-      {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
-};
-static const int NUM_WALLS     = sizeof(g_walls) / sizeof(g_walls[0]);
-static const int NUM_TRIANGLES = NUM_WALLS * 2;
-
-struct SphereDef {
-    float        radius;
-    float3       center;
-    float3       emission;
-    float3       albedo;
-    MaterialType material;
-};
-
-static const SphereDef g_spheres[] = {
-    { 16.5f, {27.0f,        16.5f,  47.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_SPECULAR    }, // Mirror
-    { 16.5f, {73.0f,        16.5f,  78.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_REFRACTIVE  }, // Glass
-    { 600.f, {50.0f, 681.6f-0.27f, 81.6f},  {12,12,12},   {0,0,0},                MAT_DIFFUSE     }, // Light
-};
-static const int NUM_SPHERES = sizeof(g_spheres) / sizeof(g_spheres[0]);
-
-// Total SBT hit group records: triangles first (one per triangle), then spheres
-static const int NUM_HG_RECORDS = NUM_TRIANGLES + NUM_SPHERES;
 
 // ---------------------------------------------------------------------------
 // Logging callback
