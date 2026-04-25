@@ -169,7 +169,7 @@ extern "C" __global__ void __raygen__rg() {
         gaze = gaze / gnorm;
         d = d + gaze;
 
-        float3 ray_origin    = params.eye + d * 130.0f;
+        float3 ray_origin    = params.eye + d * 130.0f; // changed from 130.0f to try to fix ghost ring, also tried gaze in place of d. neither worked. gaze made it way too zoomed in.
         float3 ray_direction = normalize(d);
 
         // Path trace
