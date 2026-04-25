@@ -207,11 +207,23 @@ ncu --set full -o results\phase2_optix_spheres\nsight\optix_p2_1080p_1024spp `
     --output tmp.ppm --ptx ..\shaders.ptx
 ```
 
-Phase 2 already exercises RT cores for BVH traversal and triangle intersection. Custom intersection programs (had we kept them for spheres) would not — note this when discussing RT-core utilization in the report.
+Phase 2 exercises RT cores for BVH traversal across all geometry, and for triangle intersection on the walls. The 3 spheres traverse on RT cores but their intersection runs as the built-in sphere IS program on shader cores — not the HW triangle intersector. Note this when discussing RT-core utilization in the report; the cleanest "all geometry on RT cores" measurement is Phase 3.
 
 ---
 
 ## Phase 3 — OptiX 8, Fully Triangle-Based
+
+### Why this phase exists
+
+Phase 2 is **not** fully RT-core accelerated, despite using OptiX. The RT core on Ampere does two things in hardware: (1) BVH traversal, and (2) ray-triangle intersection (fixed-function silicon). Anything that isn't a triangle gets #1 but not #2 — the intersection math runs as a shader program (an IS program) on the regular SM cores.
+
+Built-in spheres (`OPTIX_BUILD_INPUT_TYPE_SPHERES`) are a special case: NVIDIA ships an optimized sphere intersection routine bundled with the driver, and it's faster than a hand-rolled custom IS program because it's integrated with the traversal pipeline. But it is still an IS program running on shader cores — **not** the hardware triangle intersector. So Phase 2's three spheres (mirror, glass, light) take a hybrid path: HW traversal + SW intersection. The 12 wall triangles take the full HW path.
+
+This muddies the headline claim. Phase 1 → Phase 2 shows ~9× from "software CUDA path tracer" to "OptiX with mostly-RT-core geometry," but you can't cleanly attribute that delta to the RT cores when part of the scene bypasses the triangle intersector. Phase 3 puts every primitive on the same hardware path so the comparison is unambiguous, and so Nsight Compute's RT-core utilization numbers reflect the entire scene.
+
+There's a secondary empirical question worth measuring: tessellating each sphere to ~8K triangles inflates the BVH and adds work per ray. Does the hardware triangle intersector still beat the built-in sphere IS once you account for that overhead? On Ampere the expected answer is yes, but it's worth verifying rather than assuming.
+
+There's also a precision motivation. The Phase 2 wall-sphere experiment showed that analytic primitives at extreme scales (1e5 radius) fall outside the float32 hardware intersector's precision envelope. Tessellation sidesteps this entirely — every triangle is small and well-conditioned. Phase 3 finishes converting the scene to the representation that production path tracers actually use.
 
 ### Goals
 - Replace the 3 remaining built-in spheres with tessellated triangle meshes
@@ -318,10 +330,10 @@ Maintain `results/differences.md` as you go.
 1. **Recursion → iteration.** Recursive `radiance()` replaced by iterative bounce loop in ray-gen. Mathematically equivalent estimator.
 2. **Kernel structure.** Monolithic per-pixel CUDA kernel → multi-stage OptiX pipeline (raygen / closest-hit / miss / IS) invoked by the traversal engine.
 3. **Acceleration structure.** Phase 1 — linear sphere list, O(N) per ray. Phases 2/3 — hardware-accelerated BVH (IAS over per-primitive-type GASes).
-4. **Intersection hardware.**
-   - Phase 1: software ray-sphere on CUDA cores
-   - Phase 2: hardware triangle (walls) + built-in sphere primitive (3 small spheres). RT cores for BVH traversal + triangle intersection.
-   - Phase 3: hardware triangle for everything. All intersection on RT cores.
+4. **Intersection hardware.** The RT core does BVH traversal and ray-triangle intersection in fixed-function hardware; non-triangle primitives use HW traversal but execute an IS program on shader cores for the intersection.
+   - Phase 1: software ray-sphere on CUDA cores. No RT-core involvement at all.
+   - Phase 2: walls on the full HW path (traversal + triangle intersection). Three spheres on a hybrid path — HW traversal + NVIDIA's built-in sphere IS program on shader cores. Faster than custom IS, but **not** the HW triangle intersector.
+   - Phase 3: every primitive (walls + tessellated spheres) on the full HW path. All intersection on RT cores.
 5. **Wall geometry.** Phase 1 uses radius-1e5 spheres for walls (smallpt's classic trick). Phases 2/3 use real flat triangles because the OptiX 8 hardware sphere intersector is float32 only and produces visible precision banding at radius 1e5. See diagnostic experiment in `results/phase2_optix_spheres/renders/diagnostic/`.
 6. **Subpixel sampling.** Phase 1 uses smallpt's 2×2 stratified subpixel grid. Phases 2/3 simplify to a tent-filtered jitter per sample. Same converged image, slightly different convergence rate per spp.
 7. **RNG.** All phases use a per-pixel LCG. Seeding is similar but not identical (thread indexing differs slightly between the CUDA kernel and the OptiX raygen).
