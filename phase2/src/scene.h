@@ -1,20 +1,18 @@
 #pragma once
 
+// SCENE_NAME: default
+//
+// The standard Cornell box scene used by phase 2. Matches phase 1
+// (cu-smallpt) output pixel-for-pixel at 4:3 aspect ratios. Walls are flat
+// triangles widened past the room bounds (WALL_EXT) so escape paths around
+// the camera frustum and at wall seams are closed.
+
 #include "shared.h"
 
 // ---------------------------------------------------------------------------
 // Cornell box scene description
 //
 // Walls are flat quads (12 triangles total) instead of radius-1e5 spheres.
-//
-// IMPORTANT: each wall quad is extended FAR beyond the visible room bounds.
-// Phase 1's wall spheres have radius 1e5, so they're effectively infinite
-// planes from the camera's perspective. Phase 2 originally used quads sized
-// exactly to the room (x in [1,99], y in [0,81.6], z in [0,170]); this left
-// gaps at the seams between adjacent walls that primary and secondary rays
-// could escape through, hitting the giant radius-600 light sphere that
-// extends far above the ceiling. Result: bright white wedges in the top
-// corners and contaminated reflections inside the glass/mirror spheres.
 //
 // Visible-plane coordinates (unchanged from canonical smallpt):
 //   left wall:   x = 1
@@ -24,11 +22,34 @@
 //   back wall:   z = 0
 //   front wall:  z = 170 (behind the camera; black, never visible directly)
 //
-// EXT is the half-extent each wall is widened by along the two directions
-// orthogonal to its normal. Big enough to swallow any escaping ray.
+// ---------------------------------------------------------------------------
+// Why each wall is extended past the visible room:
 //
-// Spheres kept (small radii, hardware sphere is fine here):
-//   mirror, glass, light
+// Phase 1's wall spheres have radius 1e5, so they're effectively infinite
+// planes. Phase 2 originally used quads sized exactly to the room. That left
+// gaps at the seams between adjacent walls; primary rays at extreme camera
+// angles escaped past the geometry and struck the radius-600 light sphere
+// extending above the ceiling, producing bright artifacts and contaminated
+// reflections.
+//
+// Fix: each wall is widened (in the two directions parallel to its plane)
+// past the room bounds, so escape paths get filled by the same wall material
+// that would have been there in phase 1's infinite-plane scene.
+//
+// ---------------------------------------------------------------------------
+// Why WALL_EXT is 500 and not 1e5:
+//
+// A previous version used WALL_EXT = 1e5 (matching phase 1's sphere radii).
+// That broke the ceiling cutout where the light sphere protrudes: the light
+// only protrudes 0.27 units below the ceiling at y=81.33, and OptiX's float32
+// triangle intersector loses precision over very large triangles. With a
+// ~2e5-wide ceiling triangle, the t-value error at the disc was larger than
+// 0.27, so the ceiling won the closest-hit test instead of the light sphere
+// and the disc disappeared.
+//
+// 500 units is roughly 5x the room dimensions: large enough to swallow every
+// camera-frustum escape and every secondary-bounce escape, while small
+// enough that float precision over the triangles stays clean.
 // ---------------------------------------------------------------------------
 
 struct WallDef {
@@ -38,57 +59,47 @@ struct WallDef {
     MaterialType material;
 };
 
-// Extension distance: walls are pushed this far beyond visible room bounds
-// in the two directions orthogonal to their normal. 1e5 matches phase 1's
-// sphere radii so escape paths are closed at the same scale.
-#define WALL_EXT 1.0e5f
+#define WALL_EXT 500.0f
 
 static const WallDef g_walls[] = {
-    // Left wall (plane x=1), red, normal +x.
-    // Extended in y and z far beyond the room.
+    // Left wall (plane x=1), red, normal +x. Extended in y and z.
     { {1.0f, 0.0f - WALL_EXT, 0.0f - WALL_EXT},
       {1.0f, 81.6f + WALL_EXT, 0.0f - WALL_EXT},
       {1.0f, 81.6f + WALL_EXT, 170.0f + WALL_EXT},
       {1.0f, 0.0f - WALL_EXT, 170.0f + WALL_EXT},
       {0,0,0}, {0.75f, 0.25f, 0.25f}, MAT_DIFFUSE },
 
-    // Right wall (plane x=99), blue, normal -x.
+    // Right wall (plane x=99), blue, normal -x. Extended in y and z.
     { {99.0f, 0.0f - WALL_EXT, 170.0f + WALL_EXT},
       {99.0f, 81.6f + WALL_EXT, 170.0f + WALL_EXT},
       {99.0f, 81.6f + WALL_EXT, 0.0f - WALL_EXT},
       {99.0f, 0.0f - WALL_EXT, 0.0f - WALL_EXT},
       {0,0,0}, {0.25f, 0.25f, 0.75f}, MAT_DIFFUSE },
 
-    // Back wall (plane z=0), white, normal +z.
-    // Extended in x and y.
+    // Back wall (plane z=0), white, normal +z. Extended in x and y.
     { {99.0f + WALL_EXT, 0.0f - WALL_EXT,  0.0f},
       {99.0f + WALL_EXT, 81.6f + WALL_EXT, 0.0f},
       {1.0f - WALL_EXT,  81.6f + WALL_EXT, 0.0f},
       {1.0f - WALL_EXT,  0.0f - WALL_EXT,  0.0f},
       {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
 
-    // Front wall (plane z=170), black, normal -z.
-    // (Behind the camera after the d*130 origin push, but extended for
-    // consistency in case secondary rays end up traveling toward +z.)
+    // Front wall (plane z=170), black, normal -z. Extended in x and y.
+    // Behind the camera after the d*130 origin push, but extended for
+    // consistency in case secondary rays travel toward +z.
     { {1.0f - WALL_EXT,  0.0f - WALL_EXT,  170.0f},
       {1.0f - WALL_EXT,  81.6f + WALL_EXT, 170.0f},
       {99.0f + WALL_EXT, 81.6f + WALL_EXT, 170.0f},
       {99.0f + WALL_EXT, 0.0f - WALL_EXT,  170.0f},
       {0,0,0}, {0,0,0}, MAT_DIFFUSE },
 
-    // Floor (plane y=0), white, normal +y.
-    // Extended in x and z.
+    // Floor (plane y=0), white, normal +y. Extended in x and z.
     { {1.0f - WALL_EXT,  0.0f, 170.0f + WALL_EXT},
       {99.0f + WALL_EXT, 0.0f, 170.0f + WALL_EXT},
       {99.0f + WALL_EXT, 0.0f, 0.0f - WALL_EXT},
       {1.0f - WALL_EXT,  0.0f, 0.0f - WALL_EXT},
       {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
 
-    // Ceiling (plane y=81.6), white, normal -y.
-    // Extended in x and z. This is the critical one: the unextended ceiling
-    // was the main escape path for rays heading up-and-outward, which then
-    // hit the radius-600 light sphere above the room and produced the bright
-    // white wedges in the top corners of the image.
+    // Ceiling (plane y=81.6), white, normal -y. Extended in x and z.
     { {1.0f - WALL_EXT,  81.6f, 0.0f - WALL_EXT},
       {99.0f + WALL_EXT, 81.6f, 0.0f - WALL_EXT},
       {99.0f + WALL_EXT, 81.6f, 170.0f + WALL_EXT},

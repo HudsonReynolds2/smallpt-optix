@@ -246,7 +246,10 @@ static __forceinline__ __device__ float3 compute_normal(float3 hit_pos, float3 r
         float3 N_obj = normalize(cross(e1, e2));
         // Transform object-space normal to world space (handles any future IAS xform)
         float3 N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
-        return N;
+        // Orient toward the incoming ray so back-face hits (secondary bounces
+        // grazing wall seams, or rays entering from outside the room) get the
+        // same outward-facing normal that the sphere path naturally returns.
+        return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
     } else {
         // OPTIX_PRIMITIVE_TYPE_SPHERE
         const unsigned int prim_idx    = optixGetPrimitiveIndex();
@@ -296,7 +299,11 @@ extern "C" __global__ void __closesthit__ch() {
     switch (data->material) {
 
     case MAT_SPECULAR: {
-        new_dir = reflect(ray_dir, N);
+        // Use the same ray-oriented normal as diffuse so that secondary rays
+        // hitting the mirror sphere from inside (e.g. after a refraction
+        // bounce) reflect correctly instead of firing into the front wall.
+        float3 w = dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
+        new_dir = reflect(ray_dir, w);
         break;
     }
 

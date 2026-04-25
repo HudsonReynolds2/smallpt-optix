@@ -157,10 +157,15 @@ int main(int argc, char* argv[]) {
             verts.reserve(NUM_TRIANGLES * 3);
             for (int w = 0; w < NUM_WALLS; ++w) {
                 const WallDef& q = g_walls[w];
-                // Triangle 0: v0, v1, v2
-                verts.push_back(q.v0); verts.push_back(q.v1); verts.push_back(q.v2);
-                // Triangle 1: v0, v2, v3
-                verts.push_back(q.v0); verts.push_back(q.v2); verts.push_back(q.v3);
+                // Split along the v1-v3 diagonal so both triangles have a
+                // consistent CCW winding for every wall orientation.
+                // The old v0-v2 diagonal produced a non-axis-aligned cross
+                // product on the ceiling quad (and potentially others), giving
+                // a ~45-degree face normal and the visible seam artifact.
+                // Triangle 0: v0, v1, v3
+                verts.push_back(q.v0); verts.push_back(q.v1); verts.push_back(q.v3);
+                // Triangle 1: v1, v2, v3
+                verts.push_back(q.v1); verts.push_back(q.v2); verts.push_back(q.v3);
             }
 
             CUdeviceptr d_verts;
