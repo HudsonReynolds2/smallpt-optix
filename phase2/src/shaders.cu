@@ -98,8 +98,8 @@ static __forceinline__ __device__ float3 refract_or_reflect(
     if (cos2_phi < 0.0f) { pr = 1.0f; return d_re; } // TIR
 
     float3 d_tr = normalize(nn*d - nl*(nn*cos_theta + sqrtf(cos2_phi)));
-    float  c    = 1.0f - (out_to_in ? -cos_theta : dot(d_tr, n));
-    float  Re   = schlick(c, n_out, n_in);
+    float  cos_fresnel = out_to_in ? -cos_theta : dot(d_tr, n);
+    float  Re   = schlick(cos_fresnel, n_out, n_in);
     float  p_Re = 0.25f + 0.5f * Re;
 
     if (rnd(seed) < p_Re) {
