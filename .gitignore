@@ -5,3 +5,6 @@ phase2/results/*
 
 phase3/build/
 phase3/results/*
+
+phase3/reference/*.ppm
+phase3/reference/*4096*
