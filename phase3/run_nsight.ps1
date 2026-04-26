@@ -85,7 +85,7 @@ param(
     # name contains "raygen" (case insensitive). The OptiX docs say
     # kernel names start with "raygen__" -- we match the substring so
     # any user-defined raygen entry is captured.
-    [string]$KernelNameRegex = "regex:(?i)raygen",
+    [string]$KernelNameRegex = "regex:(?i)(raygen|optixLaunch)",
 
     [switch]$SkipPng,
 
@@ -274,7 +274,7 @@ foreach ($cfg in $Configs) {
         $outCsv = Join-Path $NsightDir "${name}_metrics.csv"
         $ncuArgs = @(
             "--metrics", $Metrics,
-            "--kernel-name", $KernelNameRegex,
+            "--kernel-name", "`"$KernelNameRegex`"",
             "--csv",
             "--target-processes", "all",
             "--",
@@ -343,13 +343,27 @@ foreach ($cfg in $Configs) {
             $failures += @{ Config = $name; Reason = "malformed CSV (no header)" }
             continue
         }
+        # Locate the Kernel Name column dynamically rather than hard-coding
+        # index 4: ncu's CSV column order has shifted between versions, and
+        # the PS 5.1 String.Split(string, StringSplitOptions) overload that
+        # the previous code relied on does not exist (it splits per-char on
+        # `","` rather than on the delimiter as a whole), so kernel-name
+        # extraction silently produced empty strings.
+        $headerFields = [regex]::Split($csvLines[$headerIdx], '","')
+        $headerFields = $headerFields | ForEach-Object { $_.Trim('"') }
+        $knCol = [Array]::IndexOf($headerFields, 'Kernel Name')
+        if ($knCol -lt 0) {
+            Write-Host "  FAILED: 'Kernel Name' column not found in CSV header." -ForegroundColor Red
+            $failures += @{ Config = $name; Reason = "no Kernel Name column" }
+            continue
+        }
         $kernelNames = @{}
         for ($i = $headerIdx + 1; $i -lt $csvLines.Count; $i++) {
             $line = $csvLines[$i]
             if ($line -match '^"\d+"') {
-                $fields = $line.TrimStart('"').Split('","', [StringSplitOptions]::None)
-                if ($fields.Count -ge 5) {
-                    $kn = $fields[4]
+                $fields = [regex]::Split($line, '","') | ForEach-Object { $_.Trim('"') }
+                if ($fields.Count -gt $knCol) {
+                    $kn = $fields[$knCol]
                     if (-not $kernelNames.ContainsKey($kn)) { $kernelNames[$kn] = 0 }
                     $kernelNames[$kn]++
                 }
@@ -369,7 +383,7 @@ foreach ($cfg in $Configs) {
 
         $hasRaygen = $false
         foreach ($kn in $kernelNames.Keys) {
-            if ($kn -match '(?i)raygen') { $hasRaygen = $true; break }
+            if ($kn -match '(?i)(raygen|optixLaunch)') { $hasRaygen = $true; break }
         }
         if (-not $hasRaygen) {
             Write-Host "  FAILED: no raygen kernel in profiled set." -ForegroundColor Red
@@ -398,7 +412,7 @@ foreach ($cfg in $Configs) {
         $outRep = Join-Path $NsightDir "${name}_full.ncu-rep"
         $ncuArgs = @(
             "--set", "full",
-            "--kernel-name", $KernelNameRegex,
+            "--kernel-name", "`"$KernelNameRegex`"",
             "--target-processes", "all",
             "--export", $outRep,
             "--force-overwrite",
