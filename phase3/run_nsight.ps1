@@ -302,26 +302,34 @@ function Convert-PpmToPng {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Helper: parse a numeric metric value out of the ncu CSV. Returns 0 on miss.
-# The CSV from ncu has columns: ID, Process ID, ..., Metric Name, Metric Unit, Metric Value
-# We sum across rows (multiple kernel invocations contribute multiple rows).
-function Parse-MetricSum {
+# Helper: parse all per-invocation values for a metric out of the ncu CSV.
+# The CSV has columns: ID, Process ID, ..., Metric Name, Metric Unit, Metric Value.
+# Each kernel invocation gets its own row per metric (so 4 tiles + 15 metrics
+# = 60 rows). Returns an array of (id, value) pairs which the aggregation
+# helpers below collapse appropriately.
+#
+# IMPORTANT: ncu emits per-invocation values, not pre-aggregated ones. Naive
+# summation is correct for COUNTERS (FFMA, FADD, FMUL, dram__bytes.sum,
+# anything ending in .sum) but WRONG for percentages and ratios -- summing
+# 4x ~22% gives 88% which exceeds the peak. Use Parse-MetricMean for those.
+function Parse-MetricRows {
     param([string]$CsvPath, [string]$MetricName)
-    if (-not (Test-Path $CsvPath)) { return 0.0 }
+    if (-not (Test-Path $CsvPath)) { return @() }
 
     $lines = Get-Content $CsvPath
     $headerIdx = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '^"ID"') { $headerIdx = $i; break }
     }
-    if ($headerIdx -lt 0) { return 0.0 }
+    if ($headerIdx -lt 0) { return @() }
 
     $hdr = [regex]::Split($lines[$headerIdx], '","') | ForEach-Object { $_.Trim('"') }
+    $idCol    = [Array]::IndexOf($hdr, 'ID')
     $nameCol  = [Array]::IndexOf($hdr, 'Metric Name')
     $valueCol = [Array]::IndexOf($hdr, 'Metric Value')
-    if ($nameCol -lt 0 -or $valueCol -lt 0) { return 0.0 }
+    if ($nameCol -lt 0 -or $valueCol -lt 0) { return @() }
 
-    $sum = 0.0
+    $rows = @()
     for ($i = $headerIdx + 1; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
         if (-not ($line -match '^"\d+"')) { continue }
@@ -332,9 +340,52 @@ function Parse-MetricSum {
         # Strip thousand separators ("13,701,348,177") that ncu emits with --csv
         $raw = $f[$valueCol] -replace ',', ''
         $val = 0.0
-        if ([double]::TryParse($raw, [ref]$val)) { $sum += $val }
+        if ([double]::TryParse($raw, [ref]$val)) {
+            $rows += [PSCustomObject]@{ Id = $f[$idCol]; Value = $val }
+        }
     }
-    return $sum
+    return $rows
+}
+
+# Sum across invocations. Use for counters (.sum metrics, byte counts,
+# instruction counts). Equivalent to the v3 Parse-MetricSum.
+function Parse-MetricSum {
+    param([string]$CsvPath, [string]$MetricName)
+    $rows = Parse-MetricRows -CsvPath $CsvPath -MetricName $MetricName
+    if ($rows.Count -eq 0) { return 0.0 }
+    return ($rows | Measure-Object -Property Value -Sum).Sum
+}
+
+# Time-weighted mean across invocations. Use for percentages (sm__throughput,
+# dram__throughput, *.pct_of_peak_*) and ratios (*_per_inst_executed.ratio).
+# We pull gpu__time_duration.sum from the same CSV for the weight; if it's
+# absent we fall back to plain arithmetic mean.
+function Parse-MetricMean {
+    param([string]$CsvPath, [string]$MetricName)
+    $rows = Parse-MetricRows -CsvPath $CsvPath -MetricName $MetricName
+    if ($rows.Count -eq 0) { return 0.0 }
+
+    $timeRows = Parse-MetricRows -CsvPath $CsvPath -MetricName 'gpu__time_duration.sum'
+    if ($timeRows.Count -eq 0) {
+        # No time data -- fall back to plain mean
+        return ($rows | Measure-Object -Property Value -Average).Average
+    }
+
+    # Build id -> time map
+    $timeMap = @{}
+    foreach ($r in $timeRows) { $timeMap[$r.Id] = $r.Value }
+
+    $weightedSum = 0.0
+    $totalWeight = 0.0
+    foreach ($r in $rows) {
+        $w = if ($timeMap.ContainsKey($r.Id)) { $timeMap[$r.Id] } else { 0.0 }
+        $weightedSum += $w * $r.Value
+        $totalWeight += $w
+    }
+    if ($totalWeight -le 0) {
+        return ($rows | Measure-Object -Property Value -Average).Average
+    }
+    return $weightedSum / $totalWeight
 }
 
 # -----------------------------------------------------------------------------
@@ -496,16 +547,28 @@ foreach ($cfg in $Configs) {
 
         # ---------------------------------------------------------------
         # Derive arithmetic intensity and a small summary CSV.
+        #
+        # AGGREGATION DISCIPLINE (don't mix these up):
+        #   - Counters (.sum metrics, byte/inst counts) -> Parse-MetricSum
+        #   - Percentages (*.pct_of_peak_*) and ratios (*.ratio)
+        #     -> Parse-MetricMean (time-weighted across invocations)
+        #
+        # The v3 of this script summed everything which produced wrong
+        # numbers like "DRAM 174%" for 4 tile launches each at ~44%.
         # ---------------------------------------------------------------
-        $ffma   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_ffma_pred_on.sum'
-        $fadd   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fadd_pred_on.sum'
-        $fmul   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fmul_pred_on.sum'
-        $bytes  = Parse-MetricSum -CsvPath $outCsv -MetricName 'dram__bytes.sum'
-        $timeNs = Parse-MetricSum -CsvPath $outCsv -MetricName 'gpu__time_duration.sum'
-        $smThr  = Parse-MetricSum -CsvPath $outCsv -MetricName 'sm__throughput.avg.pct_of_peak_sustained_elapsed'
-        $dramThr= Parse-MetricSum -CsvPath $outCsv -MetricName 'dram__throughput.avg.pct_of_peak_sustained_elapsed'
-        $occup  = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__warps_active.avg.pct_of_peak_sustained_active'
-        $diverg = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__thread_inst_executed_per_inst_executed.ratio'
+        $ffma   = Parse-MetricSum  -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_ffma_pred_on.sum'
+        $fadd   = Parse-MetricSum  -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fadd_pred_on.sum'
+        $fmul   = Parse-MetricSum  -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fmul_pred_on.sum'
+        $bytes  = Parse-MetricSum  -CsvPath $outCsv -MetricName 'dram__bytes.sum'
+        $timeNs = Parse-MetricSum  -CsvPath $outCsv -MetricName 'gpu__time_duration.sum'
+        $ltsHit = Parse-MetricSum  -CsvPath $outCsv -MetricName 'lts__t_sectors_lookup_hit.sum'
+        $ltsTot = Parse-MetricSum  -CsvPath $outCsv -MetricName 'lts__t_sectors.sum'
+        $smThr  = Parse-MetricMean -CsvPath $outCsv -MetricName 'sm__throughput.avg.pct_of_peak_sustained_elapsed'
+        $dramThr= Parse-MetricMean -CsvPath $outCsv -MetricName 'dram__throughput.avg.pct_of_peak_sustained_elapsed'
+        $l1Thr  = Parse-MetricMean -CsvPath $outCsv -MetricName 'l1tex__throughput.avg.pct_of_peak_sustained_active'
+        $xuPct  = Parse-MetricMean -CsvPath $outCsv -MetricName 'sm__inst_executed_pipe_xu.avg.pct_of_peak_sustained_active'
+        $occup  = Parse-MetricMean -CsvPath $outCsv -MetricName 'smsp__warps_active.avg.pct_of_peak_sustained_active'
+        $diverg = Parse-MetricMean -CsvPath $outCsv -MetricName 'smsp__thread_inst_executed_per_inst_executed.ratio'
 
         # FLOPs = 2*FFMA + FADD + FMUL  (ncu reports already summed across threads)
         $flops = (2.0 * $ffma) + $fadd + $fmul
@@ -514,42 +577,58 @@ foreach ($cfg in $Configs) {
         $gflopsps = if ($timeNs -gt 0) { $flops / ($timeNs * 1e-9) / 1e9 } else { 0 }
         # GB/s
         $gbps = if ($timeNs -gt 0) { $bytes / ($timeNs * 1e-9) / 1e9 } else { 0 }
+        # L2 hit rate
+        $l2hit = if ($ltsTot -gt 0) { ($ltsHit / $ltsTot) * 100.0 } else { 0 }
 
         Write-Host "" -ForegroundColor DarkGray
-        Write-Host "  --- Derived metrics (SUM across all profiled kernels) ---" -ForegroundColor Cyan
+        Write-Host "  --- Derived metrics (sum-for-counters, weighted-mean-for-rates) ---" -ForegroundColor Cyan
         Write-Host ("    FFMA       : {0:N0}" -f $ffma) -ForegroundColor DarkGray
         Write-Host ("    FADD       : {0:N0}" -f $fadd) -ForegroundColor DarkGray
         Write-Host ("    FMUL       : {0:N0}" -f $fmul) -ForegroundColor DarkGray
         Write-Host ("    FLOPs      : {0:N0}  (= 2*FFMA + FADD + FMUL)" -f $flops) -ForegroundColor DarkGray
         Write-Host ("    DRAM bytes : {0:N0}" -f $bytes) -ForegroundColor DarkGray
         Write-Host ("    Time (ms)  : {0:N3}" -f ($timeNs * 1e-6)) -ForegroundColor DarkGray
-        Write-Host ("    Arith Int  : {0:F3} FLOP/byte  (SM-side only; excludes RT-core work)" -f $ai) -ForegroundColor Green
-        Write-Host ("    Throughput : {0:N1} GFLOP/s, {1:N1} GB/s" -f $gflopsps, $gbps) -ForegroundColor Green
-        Write-Host ("    SM%/DRAM%  : {0:N2}% SM   /   {1:N2}% DRAM" -f $smThr, $dramThr) -ForegroundColor DarkGray
+        if ($flops -gt 0) {
+            Write-Host ("    Arith Int  : {0:F3} FLOP/byte  (SM-side only; excludes RT-core work)" -f $ai) -ForegroundColor Green
+            Write-Host ("    Throughput : {0:N1} GFLOP/s, {1:N1} GB/s" -f $gflopsps, $gbps) -ForegroundColor Green
+        } else {
+            Write-Host "    Arith Int  : NOT COMPUTABLE -- FFMA/FADD/FMUL = 0." -ForegroundColor Yellow
+            Write-Host "                 Ampere + OPTIX_FORCE_DEPRECATED_LAUNCHER does not expose" -ForegroundColor Yellow
+            Write-Host "                 SASS-level FLOP counters for the launcher wrapper kernel." -ForegroundColor Yellow
+            Write-Host "                 Use the back-of-envelope estimate from plan v3 6 instead." -ForegroundColor Yellow
+            Write-Host ("    Throughput : {0:N1} GB/s sustained DRAM" -f $gbps) -ForegroundColor Green
+        }
+        Write-Host ("    SM%/DRAM%  : {0:N2}% SM   /   {1:N2}% DRAM   (peak-sustained)" -f $smThr, $dramThr) -ForegroundColor DarkGray
+        Write-Host ("    L1TEX%     : {0:N2}%" -f $l1Thr) -ForegroundColor DarkGray
+        Write-Host ("    XU%        : {0:N2}%  (transcendental pipe)" -f $xuPct) -ForegroundColor DarkGray
+        Write-Host ("    L2 hit     : {0:N2}%  ({1:N0} of {2:N0} sectors)" -f $l2hit, $ltsHit, $ltsTot) -ForegroundColor DarkGray
         Write-Host ("    Occupancy  : {0:N2}% warps active" -f $occup) -ForegroundColor DarkGray
-        Write-Host ("    Divergence : {0:N3} threads/warp inst (32 = perfect)" -f $diverg) -ForegroundColor DarkGray
+        Write-Host ("    Divergence : {0:N3} threads/warp inst (32 = perfect; {1:N0}% utilization)" -f $diverg, ($diverg/32*100)) -ForegroundColor DarkGray
         Write-Host ""
 
         # Write a slim summary CSV alongside the raw ncu output.
         $sumPath = Join-Path $NsightDir "${name}_summary.csv"
         @(
-            "metric,value,unit"
-            "variant,$Variant,"
-            "config,$name,"
-            "ffma_count,$ffma,inst"
-            "fadd_count,$fadd,inst"
-            "fmul_count,$fmul,inst"
-            "flops_total,$flops,FLOPs"
-            "dram_bytes,$bytes,bytes"
-            "time_ns,$timeNs,ns"
-            "arithmetic_intensity,$ai,FLOP/byte"
-            "throughput_gflopsps,$gflopsps,GFLOP/s"
-            "throughput_gbps,$gbps,GB/s"
-            "sm_throughput_pct,$smThr,%"
-            "dram_throughput_pct,$dramThr,%"
-            "warps_active_pct,$occup,%"
-            "divergence_ratio,$diverg,threads/inst"
-            "raygen_kernel_named,$sawRaygenName,bool"
+            "metric,value,unit,aggregation"
+            "variant,$Variant,,"
+            "config,$name,,"
+            "ffma_count,$ffma,inst,sum"
+            "fadd_count,$fadd,inst,sum"
+            "fmul_count,$fmul,inst,sum"
+            "flops_total,$flops,FLOPs,derived"
+            "dram_bytes,$bytes,bytes,sum"
+            "time_ns,$timeNs,ns,sum"
+            "arithmetic_intensity,$ai,FLOP/byte,derived"
+            "throughput_gflopsps,$gflopsps,GFLOP/s,derived"
+            "throughput_gbps,$gbps,GB/s,derived"
+            "sm_throughput_pct,$smThr,%,weighted_mean"
+            "dram_throughput_pct,$dramThr,%,weighted_mean"
+            "l1tex_throughput_pct,$l1Thr,%,weighted_mean"
+            "xu_pipe_pct,$xuPct,%,weighted_mean"
+            "l2_hit_pct,$l2hit,%,derived"
+            "warps_active_pct,$occup,%,weighted_mean"
+            "divergence_ratio,$diverg,threads/inst,weighted_mean"
+            "raygen_kernel_named,$sawRaygenName,bool,n/a"
         ) | Out-File -FilePath $sumPath -Encoding ascii
         Write-Host "  Summary: $sumPath" -ForegroundColor Green
 
