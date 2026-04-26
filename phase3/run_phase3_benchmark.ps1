@@ -225,29 +225,44 @@ function Should-LogMem {
 function Start-MemLogger {
     param([string]$ConfigName, [string]$LogDir)
     $logPath = Join-Path $LogDir "${ConfigName}_nvsmi.csv"
-    # Sample every 100ms. The query is cheap; output goes straight to CSV.
-    # We use --loop-ms instead of -lms because the latter is older syntax
-    # and not present in all Windows CUDA installs.
-    $args = @(
+    $errPath = Join-Path $LogDir "${ConfigName}_nvsmi.err"
+    # Sample every 100ms. The correct nvidia-smi flag for sub-second polling
+    # is `-lms <ms>` (with a separate value argument). The previous v3 used
+    # `--loop-ms=100` which nvidia-smi rejects silently -- that's why the
+    # earlier run reported nvsmi=0 even though the logger appeared to run.
+    # Don't shadow the PowerShell automatic variable $args; use $nvsmiArgs.
+    $nvsmiArgs = @(
         "--query-gpu=timestamp,memory.used,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
-        "--loop-ms=100"
+        "-lms", "100"
     )
-    $proc = Start-Process -FilePath "nvidia-smi" -ArgumentList $args `
-        -NoNewWindow -PassThru -RedirectStandardOutput $logPath
-    Start-Sleep -Milliseconds 200  # let it warm up so the first sample lands
-    return @{ Process = $proc; LogPath = $logPath }
+    $proc = Start-Process -FilePath "nvidia-smi" -ArgumentList $nvsmiArgs `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $logPath `
+        -RedirectStandardError  $errPath
+    Start-Sleep -Milliseconds 250  # let nvidia-smi spin up + emit first sample
+    return @{ Process = $proc; LogPath = $logPath; ErrPath = $errPath }
 }
 
 function Stop-MemLogger {
     param($Logger)
-    if ($null -eq $Logger) { return }
+    if ($null -eq $Logger) { return 0 }
     try {
         if (-not $Logger.Process.HasExited) {
             Stop-Process -Id $Logger.Process.Id -Force -ErrorAction SilentlyContinue
         }
     } catch {}
-    # Parse the CSV and report peak MB
+    # If nvidia-smi rejected the flags, it'll have written to stderr and the
+    # CSV will be empty. Surface that explicitly.
+    if (Test-Path $Logger.ErrPath) {
+        $errText = (Get-Content $Logger.ErrPath -Raw).Trim()
+        if ($errText -ne "") {
+            Write-Host "  nvsmi stderr:" -ForegroundColor Yellow
+            $errText -split "`n" | Select-Object -First 5 | ForEach-Object {
+                Write-Host "    $_" -ForegroundColor Yellow
+            }
+        }
+    }
     if (Test-Path $Logger.LogPath) {
         $maxMb = 0
         Get-Content $Logger.LogPath | ForEach-Object {
