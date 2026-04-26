@@ -219,25 +219,32 @@ extern "C" __global__ void __miss__ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Compute surface normal. Walls use face normal; tessellated spheres use the
-// analytic normal (hit_pos - sphere_center) stored in HitGroupData for smooth
-// shading regardless of tessellation resolution.
+// Compute surface normal.
+//   - Sphere: analytic outward normal (hit_pos - sphere_center). Returned
+//     UNFLIPPED so refract_or_reflect can use dot(N, ray_dir) to decide
+//     whether the ray is entering or exiting the medium. The MAT_SPECULAR
+//     and MAT_DIFFUSE branches do their own flip-toward-ray locally.
+//   - Wall (triangle): face normal flipped to face the incoming ray, so
+//     back-face hits along wall-skirt seams shade with the room-side
+//     orientation rather than going black.
 // ---------------------------------------------------------------------------
 static __forceinline__ __device__ float3 compute_normal(
     float3 hit_pos, float3 ray_dir, const HitGroupData* data)
 {
-    float3 N;
     if (data->is_sphere) {
-        N = normalize(hit_pos - data->sphere_center);
-    } else {
-        const unsigned int prim_idx    = optixGetPrimitiveIndex();
-        const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
-        const OptixTraversableHandle gas = optixGetGASTraversableHandle();
-        float3 verts[3];
-        optixGetTriangleVertexData(gas, prim_idx, sbt_gas_idx, 0.0f, verts);
-        float3 N_obj = normalize(cross(verts[1]-verts[0], verts[2]-verts[0]));
-        N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
+        // Outward geometric normal, NOT flipped to face the ray. Phase 2's
+        // built-in-sphere path returned this same unflipped normal, and the
+        // refraction code below depends on that contract.
+        return normalize(hit_pos - data->sphere_center);
     }
+
+    const unsigned int prim_idx    = optixGetPrimitiveIndex();
+    const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
+    const OptixTraversableHandle gas = optixGetGASTraversableHandle();
+    float3 verts[3];
+    optixGetTriangleVertexData(gas, prim_idx, sbt_gas_idx, 0.0f, verts);
+    float3 N_obj = normalize(cross(verts[1]-verts[0], verts[2]-verts[0]));
+    float3 N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
     return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
 }
 
