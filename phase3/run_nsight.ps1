@@ -207,7 +207,7 @@ try {
 # -----------------------------------------------------------------------------
 if ($Mode -eq "quick") {
     $Configs = @(
-        @{ Name = "1024x768_64spp"; Width = 1024; Height = 768; Spp = 64 }
+        @{ Name = "1024x768_512spp"; Width = 1024; Height = 768; Spp = 512 }
     )
 } else {
     $Configs = @(
