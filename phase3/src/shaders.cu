@@ -221,21 +221,46 @@ extern "C" __global__ void __miss__ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Compute world-space triangle face normal at the current hit.
-// Phase 3: all geometry is triangles, no sphere branch needed.
+// Compute world-space surface normal at the current hit.
+// Branches on primitive type:
+//   - Built-in triangle: cross product of two edges (face normal); orient via
+//     optixIsFrontFaceHit so we always get the outward-facing side relative to
+//     the incoming ray direction. The Cornell walls don't have vertex normals,
+//     so flat shading is correct.
+//   - Built-in sphere:   (hit_pos - center).normalize(). Sphere center is read
+//     via optixGetSphereData (requires ALLOW_RANDOM_VERTEX_ACCESS on the GAS).
 // ---------------------------------------------------------------------------
 static __forceinline__ __device__ float3 compute_normal(float3 hit_pos, float3 ray_dir) {
-    const unsigned int prim_idx    = optixGetPrimitiveIndex();
-    const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
-    const OptixTraversableHandle gas = optixGetGASTraversableHandle();
+    const OptixPrimitiveType pt = optixGetPrimitiveType();
 
-    float3 verts[3];
-    optixGetTriangleVertexData(gas, prim_idx, sbt_gas_idx, 0.0f, verts);
+    if (pt == OPTIX_PRIMITIVE_TYPE_TRIANGLE) {
+        const unsigned int prim_idx    = optixGetPrimitiveIndex();
+        const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
+        const OptixTraversableHandle gas = optixGetGASTraversableHandle();
 
-    float3 e1 = verts[1] - verts[0];
-    float3 e2 = verts[2] - verts[0];
-    float3 N = normalize(optixTransformNormalFromObjectToWorldSpace(normalize(cross(e1, e2))));
-    return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
+        float3 verts[3];
+        optixGetTriangleVertexData(gas, prim_idx, sbt_gas_idx, 0.0f, verts);
+
+        float3 e1 = verts[1] - verts[0];
+        float3 e2 = verts[2] - verts[0];
+        float3 N_obj = normalize(cross(e1, e2));
+        // Transform object-space normal to world space (handles any future IAS xform)
+        float3 N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
+        // Orient toward the incoming ray so back-face hits (secondary bounces
+        // grazing wall seams, or rays entering from outside the room) get the
+        // same outward-facing normal that the sphere path naturally returns.
+        return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
+    } else {
+        // OPTIX_PRIMITIVE_TYPE_SPHERE
+        const unsigned int prim_idx    = optixGetPrimitiveIndex();
+        const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
+        const OptixTraversableHandle gas = optixGetGASTraversableHandle();
+        float4 q;
+        optixGetSphereData(gas, prim_idx, sbt_gas_idx, 0.0f, &q);
+
+        float3 center_ws = optixTransformPointFromObjectToWorldSpace(make_float3(q.x, q.y, q.z));
+        return normalize(hit_pos - center_ws);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,19 +280,24 @@ extern "C" __global__ void __closesthit__ch() {
 
     float3 N = compute_normal(hit_pos, ray_dir);
 
-    // Accumulate emission, multiply throughput by albedo
+    // Accumulate emission
     prd->radiance += prd->throughput * data->emission;
-    prd->throughput *= data->albedo;
 
-    // Russian roulette after depth 4
+    // Russian roulette after depth 4: use throughput luminance BEFORE albedo multiply.
+    // Must use throughput (not albedo) so the light sphere (albedo=0) doesn't
+    // always terminate paths that just hit it.
     if (prd->depth > 4) {
-        float cont = fmaxf3(data->albedo);
+        float cont = fmaxf3(prd->throughput);
+        cont = fminf(cont, 1.0f);
         if (rnd(prd->seed) >= cont) {
             prd->done = 1;
             return;
         }
         prd->throughput /= cont;
     }
+
+    // Multiply throughput by albedo after RR decision
+    prd->throughput *= data->albedo;
 
     // Scatter
     float3 new_dir;
