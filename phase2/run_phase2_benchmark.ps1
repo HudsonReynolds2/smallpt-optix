@@ -55,6 +55,10 @@ $RunInfoPath = Join-Path $RunDir   "run_info.txt"
 # cleanly: 4x, 16x, 64x... pixels. SPP doubles in steps for linear scaling.
 # -----------------------------------------------------------------------------
 $Configs = @(
+    @{ Name = "4096x3072_4096spp";  Width = 4096; Height = 3072; Spp = 4096  }
+)
+
+$Configs2 = @(
     @{ Name = "512x384_256spp";    Width = 512;  Height = 384;  Spp = 256  },
     @{ Name = "512x384_1024spp";   Width = 512;  Height = 384;  Spp = 1024 },
     @{ Name = "1024x768_256spp";   Width = 1024; Height = 768;  Spp = 256  },
@@ -62,7 +66,8 @@ $Configs = @(
     @{ Name = "1024x768_4096spp";  Width = 1024; Height = 768;  Spp = 4096 },
     @{ Name = "2048x1536_256spp";  Width = 2048; Height = 1536; Spp = 256  },
     @{ Name = "2048x1536_1024spp"; Width = 2048; Height = 1536; Spp = 1024 },
-    @{ Name = "4096x3072_256spp";  Width = 4096; Height = 3072; Spp = 256  }
+    @{ Name = "4096x3072_256spp";  Width = 4096; Height = 3072; Spp = 256  },
+    @{ Name = "4096x3072_1024spp";  Width = 4096; Height = 3072; Spp = 1024  }
 )
 
 # -----------------------------------------------------------------------------

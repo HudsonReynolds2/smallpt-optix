@@ -2,162 +2,75 @@
 
 // SCENE_NAME: default
 //
-// The standard Cornell box scene used by phase 2. Matches phase 1
-// (cu-smallpt) output pixel-for-pixel at 4:3 aspect ratios. Walls are
-// tessellated triangle meshes (visible room face + extension skirts) so
-// large flat surfaces don't suffer float32 t-value precision loss when
-// they fight a nearby curved surface for a closest-hit (see the precision
-// note further down).
+// Phase 3 scene: walls AND spheres are tessellated triangle meshes.
+// The mirror, glass, and light spheres -- which were OptiX built-in
+// spheres in phase 2 -- are now lat/lon UV-tessellated triangle meshes,
+// so the entire scene is one triangle GAS, no IAS.
 
 #include "shared.h"
 
 #include <cstdint>
 #include <vector>
+#include <cmath>
 
-// ---------------------------------------------------------------------------
-// Cornell box scene description
-//
-// Visible-plane coordinates (unchanged from canonical smallpt):
-//   left wall:   x = 1
-//   right wall:  x = 99
-//   floor:       y = 0
-//   ceiling:     y = 81.6
-//   back wall:   z = 0
-//   front wall:  z = 300 (behind the camera; black, never visible directly)
+#ifndef SPHERE_TESS_LAT
+#define SPHERE_TESS_LAT 64
+#endif
+#ifndef SPHERE_TESS_LON
+#define SPHERE_TESS_LON 64
+#endif
+
+// (Wall tessellation explanation preserved from phase 2 below.)
 //
 // ---------------------------------------------------------------------------
 // Why each wall is extended past the visible room (skirts):
-//
 // Phase 1's wall spheres have radius 1e5, so they're effectively infinite
 // planes. Phase 2 originally used quads sized exactly to the room. That
 // left gaps at the seams between adjacent walls; primary rays at extreme
 // camera angles escaped past the geometry and struck the radius-600 light
-// sphere extending above the ceiling, producing bright artifacts and
-// contaminated reflections.
+// sphere extending above the ceiling.
 //
-// Fix: each wall is widened (in the two directions parallel to its plane)
-// past the room bounds, so escape paths get filled by the same wall
-// material that would have been there in phase 1's infinite-plane scene.
+// Why WALL_EXT is 500: large enough to swallow escapes, small enough that
+// float precision over the triangles stays clean.
 //
-// ---------------------------------------------------------------------------
-// Why WALL_EXT is 500 and not 1e5:
-//
-// A previous version used WALL_EXT = 1e5 (matching phase 1's sphere radii).
-// That broke the ceiling cutout where the light sphere protrudes: OptiX's
-// float32 triangle intersector loses precision over very large triangles,
-// and a single ~2e5-wide ceiling triangle had t-error larger than the
-// sphere/ceiling separation, so the ceiling won the closest-hit test
-// instead of the light sphere and the disc disappeared.
-//
-// 500 units is roughly 5x the room dimensions: large enough to swallow
-// every camera-frustum escape and every secondary-bounce escape, while
-// small enough that float precision over the triangles stays clean.
-//
-// ---------------------------------------------------------------------------
-// Why the walls are TESSELLATED (not single quads):
-//
-// Even after dropping WALL_EXT from 1e5 to 500, the visible portion of
-// each wall is still a single ~100x170 unit triangle pair. With the light
-// sphere protruding only ~0.27 units below the ceiling, the float32
-// t-value error along that 170-unit triangle was occasionally larger than
-// 0.27 in pixels near where the sphere meets the ceiling. Result: a band
-// of pixels where the ceiling won the closest-hit race instead of the
-// light sphere, producing a visible horizontal banding artifact across
-// the ceiling.
-//
-// The fix is straightforward: subdivide each wall into a grid of small
-// triangles. When the largest triangle a primary ray can intersect is
-// only ~6 units across instead of 170 units, the relative t-error per
-// intersection drops by an order of magnitude and the closest-hit test
-// resolves cleanly. This is also what every production renderer does --
-// real Cornell box scenes are not single huge quads.
-//
-// Tessellation scheme (per wall):
-//   - Visible region (the actual room face) is split into a uniform NxN
-//     grid of cells (default N=16, so 16x16 = 256 cells = 512 triangles).
-//   - Each of the four extension skirts (left/right/top/bottom edges
-//     beyond the room) is one large quad (= 2 triangles).
-//   - Each of the four extension corners is one large quad (= 2 triangles).
-//   - Total: NxN + 8 quads per wall.
-//
-// The grid is built so that visible-region cells share their boundary
-// vertices with the adjacent skirt cells (no T-junctions, watertight).
-// The skirts can stay coarse because they are never visible to primary
-// rays -- they only catch secondary rays escaping through wall seams,
-// where precision near the room boundary is irrelevant.
+// Why walls are TESSELLATED: float32 t-error along a 170-unit triangle
+// was occasionally larger than the light-sphere protrusion, producing
+// horizontal banding on the ceiling. Subdividing brings the largest tri
+// to ~6 units and resolves the closest-hit cleanly.
 // ---------------------------------------------------------------------------
 
 #define WALL_EXT          500.0f
-#define WALL_TESS_N       16     // visible-region grid resolution per side
+#define WALL_TESS_N       16
 
-// A wall is an axis-aligned rectangular face of the room with extension
-// skirts. The plane is fixed by (const_axis, const_value); the two
-// in-plane axes are (u_axis, v_axis), with the visible region spanning
-// [u_min, u_max] x [v_min, v_max]. normal_sign is +1 or -1 along
-// const_axis (which side of the plane the room is on).
-//
-// CCW winding (when viewed from inside the room, i.e. from the side the
-// normal points to) is encoded by ordering quad vertices as:
-//     (u_min, v_min) -> (u_max, v_min) -> (u_max, v_max) -> (u_min, v_max)
-// then flipping if normal_sign is negative.
 struct WallDef {
-    int          const_axis;     // 0=x, 1=y, 2=z
+    int          const_axis;
     float        const_value;
-    int          u_axis;         // 0=x, 1=y, 2=z (perpendicular to const_axis)
-    int          v_axis;         // 0=x, 1=y, 2=z (perpendicular to both)
-    float        u_min, u_max;   // visible-region bounds along u_axis
-    float        v_min, v_max;   // visible-region bounds along v_axis
-    int          normal_sign;    // +1 or -1: which side the room is on
+    int          u_axis;
+    int          v_axis;
+    float        u_min, u_max;
+    float        v_min, v_max;
+    int          normal_sign;
     float3       emission;
     float3       albedo;
     MaterialType material;
 };
 
 static const WallDef g_walls[] = {
-    // Left wall (plane x=1), red, normal +x. u=z, v=y.
     { 0, 1.0f,    2, 1,    0.0f, 170.0f,   0.0f, 81.6f,   +1,
       {0,0,0}, {0.75f, 0.25f, 0.25f}, MAT_DIFFUSE },
-
-    // Right wall (plane x=99), blue, normal -x. u=z, v=y.
     { 0, 99.0f,   2, 1,    0.0f, 170.0f,   0.0f, 81.6f,   -1,
       {0,0,0}, {0.25f, 0.25f, 0.75f}, MAT_DIFFUSE },
-
-    // Back wall (plane z=0), white, normal +z. u=x, v=y.
     { 2, 0.0f,    0, 1,    1.0f, 99.0f,    0.0f, 81.6f,   +1,
       {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
-
-    // Front wall (plane z=300), black, normal -z. u=x, v=y.
-    // z=300 is past eye.z=295.6 so ray origins computed as eye+d*130 are
-    // always behind this wall; otherwise rays reflecting off the mirror
-    // sphere's bottom would strike z=170 as a valid forward hit and
-    // return black, unlike phase 1 where the camera is inside the front
-    // wall sphere (radius 1e5 centered at z=-99999.83, surface at z=170.17).
     { 2, 300.0f,  0, 1,    1.0f, 99.0f,    0.0f, 81.6f,   -1,
       {0,0,0}, {0,0,0}, MAT_DIFFUSE },
-
-    // Floor (plane y=0), white, normal +y. u=x, v=z.
     { 1, 0.0f,    0, 2,    1.0f, 99.0f,    0.0f, 170.0f,  +1,
       {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
-
-    // Ceiling (plane y=81.6), white, normal -y. u=x, v=z.
     { 1, 81.6f,   0, 2,    1.0f, 99.0f,    0.0f, 170.0f,  -1,
       {0,0,0}, {0.75f, 0.75f, 0.75f}, MAT_DIFFUSE },
 };
 static const int NUM_WALLS = sizeof(g_walls) / sizeof(g_walls[0]);
 
-// ---------------------------------------------------------------------------
-// Build the triangle list for a single wall.
-//
-// Layout: a (N+2) x (N+2) grid of vertices covering the extended quad,
-// with grid lines at:
-//     u: [u_min - WALL_EXT, u_min, u_min + (u_max-u_min)/N, ..., u_max,
-//         u_max + WALL_EXT]
-//     v: same scheme.
-// Two triangles per cell, written as 6 standalone vertices (no index
-// buffer -- matches main.cpp's existing layout for simplicity).
-//
-// CCW winding when viewed from the room side: depends on normal_sign.
-// ---------------------------------------------------------------------------
 static inline float3 make_axis_point(const WallDef& w, float u, float v) {
     float xyz[3];
     xyz[w.const_axis] = w.const_value;
@@ -169,10 +82,6 @@ static inline float3 make_axis_point(const WallDef& w, float u, float v) {
 static inline void tessellate_wall(const WallDef& w, int N,
                                    std::vector<float3>& verts_out)
 {
-    // Build 1D coordinate arrays along u and v (length N+3).
-    // Indices 0 and N+2 are the skirt extents; indices 1..N+1 are the
-    // uniform subdivision of the visible region (so cells [0..N) are the
-    // visible grid, and the outermost cells on each side are the skirts).
     float u_coord[WALL_TESS_N + 3];
     float v_coord[WALL_TESS_N + 3];
     u_coord[0]     = w.u_min - WALL_EXT;
@@ -185,24 +94,9 @@ static inline void tessellate_wall(const WallDef& w, int N,
         v_coord[i + 1] = w.v_min + t * (w.v_max - w.v_min);
     }
 
-    // Determine the orientation flip. With unit basis vectors e_u, e_v, e_n
-    // along (u_axis, v_axis, const_axis), the axis triple (e_u, e_v, e_n) is
-    // right-handed (cross(e_u, e_v) = +e_n) when it's a cyclic permutation of
-    // (x,y,z). That happens iff (v_axis - u_axis) mod 3 == 1.
-    //   - Right-handed and normal_sign=+1   -> CCW winding emits tri pointing +const_axis: OK
-    //   - Right-handed and normal_sign=-1   -> need to flip
-    //   - Left-handed  and normal_sign=+1   -> need to flip
-    //   - Left-handed  and normal_sign=-1   -> already pointing the right way
     const bool right_handed = ((w.v_axis - w.u_axis + 3) % 3) == 1;
     const bool standard_winding = (right_handed == (w.normal_sign > 0));
 
-    // For each (N+2) x (N+2) cell, emit two triangles.
-    // Standard order is:
-    //   tri 0: (p00, p10, p11)
-    //   tri 1: (p00, p11, p01)
-    // where cross(p10-p00, p11-p00) gives +cross(e_u, e_v). When that
-    // direction matches the room-side normal we keep this order; otherwise
-    // we reverse the per-triangle vertex order.
     const int total_cells = (N + 2) * (N + 2);
     verts_out.reserve(verts_out.size() + total_cells * 6);
 
@@ -227,34 +121,11 @@ static inline void tessellate_wall(const WallDef& w, int N,
     }
 }
 
-// Triangles per wall after tessellation: (N+2)^2 cells x 2 tris/cell.
 static inline int triangles_per_wall(int N) { return (N + 2) * (N + 2) * 2; }
 
 // ---------------------------------------------------------------------------
-// Build the full scene triangle list.
-//
-// verts_out:        flat vertex array, 3 verts per triangle (no index buffer)
-// tri_wall_idx_out: parallel array of length num_triangles, giving the
-//                   wall index (0..NUM_WALLS-1) each triangle belongs to.
-//                   Used as the SBT index offset so all triangles of one
-//                   wall share that wall's hit group record.
+// Sphere definitions (matched to canonical smallpt)
 // ---------------------------------------------------------------------------
-static inline void build_wall_geometry(int N,
-                                       std::vector<float3>&    verts_out,
-                                       std::vector<uint32_t>& tri_wall_idx_out)
-{
-    verts_out.clear();
-    tri_wall_idx_out.clear();
-    const int tris_per_wall = triangles_per_wall(N);
-    tri_wall_idx_out.reserve(NUM_WALLS * tris_per_wall);
-
-    for (int w = 0; w < NUM_WALLS; ++w) {
-        tessellate_wall(g_walls[w], N, verts_out);
-        for (int t = 0; t < tris_per_wall; ++t)
-            tri_wall_idx_out.push_back((uint32_t)w);
-    }
-}
-
 struct SphereDef {
     float        radius;
     float3       center;
@@ -263,14 +134,125 @@ struct SphereDef {
     MaterialType material;
 };
 
-// Sphere definitions match canonical smallpt / cu-smallpt exactly.
 static const SphereDef g_spheres[] = {
-    { 16.5f, {27.0f,        16.5f,  47.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_SPECULAR    }, // Mirror
-    { 16.5f, {73.0f,        16.5f,  78.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_REFRACTIVE  }, // Glass
-    { 600.f, {50.0f, 681.6f-0.27f, 81.6f},  {12,12,12},   {0,0,0},                MAT_DIFFUSE     }, // Light
+    { 16.5f, {27.0f,        16.5f,  47.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_SPECULAR    },
+    { 16.5f, {73.0f,        16.5f,  78.0f}, {0,0,0},      {0.999f,0.999f,0.999f}, MAT_REFRACTIVE  },
+    { 600.f, {50.0f, 681.6f-0.27f, 81.6f},  {12,12,12},   {0,0,0},                MAT_DIFFUSE     },
 };
 static const int NUM_SPHERES = sizeof(g_spheres) / sizeof(g_spheres[0]);
 
-// SBT layout: one hit group record per wall (NUM_WALLS), then one per sphere.
-// Triangles within a wall share a record via sbtIndexOffsetBuffer.
+// ---------------------------------------------------------------------------
+// Sphere tessellation: standard lat/lon UV sphere.
+//
+// lat_segments rows of latitude (poles at top/bottom), lon_segments columns
+// of longitude. The poles are degenerate triangle fans; the body is a grid
+// of quads each split into 2 triangles. CCW winding when viewed from
+// outside the sphere -> outward-facing normals via cross(e1,e2) in
+// compute_normal (which then auto-orients via dot(N, ray_dir)).
+//
+// Outputs raw vertex stream (no index buffer), 3 verts/triangle, matching
+// the wall layout.
+// ---------------------------------------------------------------------------
+static inline int triangles_per_sphere(int lat, int lon) {
+    // Top cap: lon triangles. Bottom cap: lon triangles.
+    // Body: (lat - 2) rows of lon quads = (lat - 2) * lon * 2 triangles.
+    return 2 * lon + (lat - 2) * lon * 2;
+}
+
+static inline float3 sphere_point(float3 center, float radius,
+                                  int i_lat, int i_lon,
+                                  int lat_segments, int lon_segments)
+{
+    // Latitude theta in [0, pi]: 0 = north pole (+y), pi = south pole (-y).
+    float theta = (float)i_lat * (float)M_PI / (float)lat_segments;
+    float phi   = (float)i_lon * 2.0f * (float)M_PI / (float)lon_segments;
+
+    float sin_t = sinf(theta);
+    float cos_t = cosf(theta);
+    float sin_p = sinf(phi);
+    float cos_p = cosf(phi);
+
+    return make_float3(
+        center.x + radius * sin_t * cos_p,
+        center.y + radius * cos_t,
+        center.z + radius * sin_t * sin_p
+    );
+}
+
+static inline void tessellate_sphere(float3 center, float radius,
+                                     int lat_segments, int lon_segments,
+                                     std::vector<float3>& verts_out)
+{
+    const int tris = triangles_per_sphere(lat_segments, lon_segments);
+    verts_out.reserve(verts_out.size() + tris * 3);
+
+    float3 north = make_float3(center.x, center.y + radius, center.z);
+    float3 south = make_float3(center.x, center.y - radius, center.z);
+
+    // Top cap (i_lat = 0 is north pole, i_lat = 1 is first ring below).
+    for (int j = 0; j < lon_segments; ++j) {
+        float3 a = sphere_point(center, radius, 1, j,     lat_segments, lon_segments);
+        float3 b = sphere_point(center, radius, 1, j + 1, lat_segments, lon_segments);
+        // CCW from outside: north, b, a (so cross(b-north, a-north) points outward)
+        verts_out.push_back(north);
+        verts_out.push_back(b);
+        verts_out.push_back(a);
+    }
+
+    // Body: rings between i_lat=1 and i_lat=lat_segments-1.
+    for (int i = 1; i < lat_segments - 1; ++i) {
+        for (int j = 0; j < lon_segments; ++j) {
+            float3 p00 = sphere_point(center, radius, i,     j,     lat_segments, lon_segments);
+            float3 p10 = sphere_point(center, radius, i,     j + 1, lat_segments, lon_segments);
+            float3 p11 = sphere_point(center, radius, i + 1, j + 1, lat_segments, lon_segments);
+            float3 p01 = sphere_point(center, radius, i + 1, j,     lat_segments, lon_segments);
+            // Quad split into two CCW-from-outside triangles
+            verts_out.push_back(p00); verts_out.push_back(p10); verts_out.push_back(p11);
+            verts_out.push_back(p00); verts_out.push_back(p11); verts_out.push_back(p01);
+        }
+    }
+
+    // Bottom cap.
+    for (int j = 0; j < lon_segments; ++j) {
+        float3 a = sphere_point(center, radius, lat_segments - 1, j,     lat_segments, lon_segments);
+        float3 b = sphere_point(center, radius, lat_segments - 1, j + 1, lat_segments, lon_segments);
+        // CCW from outside: south, a, b
+        verts_out.push_back(south);
+        verts_out.push_back(a);
+        verts_out.push_back(b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build the full scene triangle list.
+// PHASE 3: walls THEN spheres in one flat array. SBT index per triangle
+// goes 0..NUM_WALLS-1 for walls, then NUM_WALLS..NUM_WALLS+NUM_SPHERES-1
+// for spheres, so each surface still has its own hit group record.
+// ---------------------------------------------------------------------------
+static inline void build_scene_geometry(int wall_N, int sph_lat, int sph_lon,
+                                        std::vector<float3>&    verts_out,
+                                        std::vector<uint32_t>& tri_sbt_idx_out)
+{
+    verts_out.clear();
+    tri_sbt_idx_out.clear();
+
+    const int wall_tris = triangles_per_wall(wall_N);
+    const int sph_tris  = triangles_per_sphere(sph_lat, sph_lon);
+    tri_sbt_idx_out.reserve(NUM_WALLS * wall_tris + NUM_SPHERES * sph_tris);
+
+    for (int w = 0; w < NUM_WALLS; ++w) {
+        tessellate_wall(g_walls[w], wall_N, verts_out);
+        for (int t = 0; t < wall_tris; ++t)
+            tri_sbt_idx_out.push_back((uint32_t)w);
+    }
+
+    for (int s = 0; s < NUM_SPHERES; ++s) {
+        tessellate_sphere(g_spheres[s].center, g_spheres[s].radius,
+                          sph_lat, sph_lon, verts_out);
+        for (int t = 0; t < sph_tris; ++t)
+            tri_sbt_idx_out.push_back((uint32_t)(NUM_WALLS + s));
+    }
+}
+
+// SBT layout: one hit group record per wall, then one per sphere.
 static const int NUM_HG_RECORDS = NUM_WALLS + NUM_SPHERES;
