@@ -42,6 +42,16 @@ struct Params {
     unsigned int           tile_origin_x;
     unsigned int           tile_origin_y;
 
+    // Maximum number of bounces per ray. Hardcoded literal `20` was used
+    // before; now parameterized so we can run a depth ablation for the
+    // EC527 deck without recompiling. RR (depth>4) makes high values nearly
+    // free, but the ablation curve is informative.
+    //
+    // pipelineLinkOptions.maxTraceDepth must be >= this value at pipeline
+    // creation time, so on the host side we still pass 20 to OptiX even
+    // when we run with a smaller cap; the loop just exits sooner.
+    unsigned int           max_bounces;
+
     // Camera (smallpt Cornell box)
     float3                 eye;
     float3                 cx;   // right vector scaled by fov/aspect

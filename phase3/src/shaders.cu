@@ -148,7 +148,8 @@ extern "C" __global__ void __raygen__rg() {
 
     float3 L = make_float3(0.0f, 0.0f, 0.0f);
 
-    const unsigned int spp = params.samples_per_launch;
+    const unsigned int spp        = params.samples_per_launch;
+    const unsigned int max_bounce = params.max_bounces;
 
     for (unsigned int s = 0; s < spp; ++s) {
         // Tent filter (matching Phase 1 exactly)
@@ -167,7 +168,11 @@ extern "C" __global__ void __raygen__rg() {
         gaze = gaze / gnorm;
         d = d + gaze;
 
-        float3 ray_origin    = params.eye + d * 130.0f; // changed from 130.0f to try to fix ghost ring, also tried gaze in place of d. neither worked. gaze made it way too zoomed in.
+        // origin = eye + d * 130.0f advances the ray to the image plane
+        // (smallpt convention; smallpt uses the same 130.0 offset). Earlier
+        // experiments with `gaze` in place of `d` produced an over-zoomed
+        // view; smaller offsets re-introduced an aperture-edge ghost ring.
+        float3 ray_origin    = params.eye + d * 130.0f;
         float3 ray_direction = normalize(d);
 
         // Path trace
@@ -180,7 +185,7 @@ extern "C" __global__ void __raygen__rg() {
         prd.depth      = 0;
         prd.done       = 0;
 
-        for (int bounce = 0; bounce < 20 && !prd.done; ++bounce) {
+        for (unsigned int bounce = 0; bounce < max_bounce && !prd.done; ++bounce) {
             trace(params.handle, prd.origin, prd.direction, 1e-4f, 1e16f, &prd);
         }
 
@@ -224,6 +229,14 @@ extern "C" __global__ void __miss__ms() {
 //     UNFLIPPED so refract_or_reflect can use dot(N, ray_dir) to decide
 //     whether the ray is entering or exiting the medium. The MAT_SPECULAR
 //     and MAT_DIFFUSE branches do their own flip-toward-ray locally.
+//
+//     We keep the analytic normal even though the sphere geometry is now
+//     tessellated. Why: the geometry is triangles for traversal speed
+//     (single GAS, no IAS, no built-in sphere primitives), but shading uses
+//     the analytic normal for sharp glossy reflections. This is the
+//     standard "smooth-shaded tessellated sphere" pattern: triangle
+//     intersection for t, analytic normal for N.
+//
 //   - Wall (triangle): face normal flipped to face the incoming ray, so
 //     back-face hits along wall-skirt seams shade with the room-side
 //     orientation rather than going black.

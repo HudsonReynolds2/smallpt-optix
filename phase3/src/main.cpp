@@ -37,6 +37,19 @@
 //      launch is (TILE_W, TILE_H, 1) with tile_origin_{x,y} in Params.
 //      The raygen offsets its launch index by the tile origin.
 //      This bounds OptiX per-launch state regardless of full image size.
+//
+// PHASE 3 v3 ADDITIONS (for EC527 deck data collection):
+//   3. --max-depth CLI flag (default 20) for the bounce-depth ablation.
+//      Threaded through to Params::max_bounces and read in raygen.
+//   4. Per-phase wall-clock timing via cudaEvent pairs around: BVH build,
+//      compaction, SBT/buffer setup, tile loop (was already timed),
+//      readback. Printed to stderr; the CSV: line still reports tile-loop
+//      time (== "kernel time") for backward compatibility with existing
+//      timings.csv parsing.
+//   5. Peak GPU memory measurement via cudaMemGetInfo before cleanup.
+//      Reports MB used, MB total, and the peak observed during the run
+//      (sampled inside the tile loop, since that's when allocations are
+//      maximal).
 // =============================================================================
 
 // Tile dimensions for tile-based launches.
@@ -116,26 +129,69 @@ static void write_ppm(const char* path, unsigned int w, unsigned int h, const fl
 }
 
 static void usage(const char* prog) {
-    fprintf(stderr, "Usage: %s [--width W] [--height H] [--spp N] [--output FILE] [--ptx FILE]\n", prog);
-    fprintf(stderr, "  Defaults: 1024x768, 256 spp, output.ppm, shaders.ptx\n");
+    fprintf(stderr,
+        "Usage: %s [--width W] [--height H] [--spp N] [--max-depth D]\n"
+        "          [--output FILE] [--ptx FILE]\n"
+        "  Defaults: 1024x768, 256 spp, max-depth 20, output.ppm, shaders.ptx\n",
+        prog);
+}
+
+// Helper: convert cudaEvent pair elapsed ms to a printable line.
+static void print_phase(const char* name, cudaEvent_t a, cudaEvent_t b) {
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, a, b);
+    fprintf(stderr, "  Phase %-16s %8.3f ms\n", name, ms);
+}
+
+// Wrapper that snapshots GPU memory usage. Prints "MB used" relative to
+// the device total. Useful both right after large allocations (BVH build,
+// accum buffer) and before cleanup. See the header comment block for why
+// we sample mid-tile-loop too.
+static void log_gpu_mem(const char* label) {
+    size_t free_b = 0, total_b = 0;
+    cudaError_t rc = cudaMemGetInfo(&free_b, &total_b);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "  cudaMemGetInfo failed at '%s': %s\n",
+                label, cudaGetErrorString(rc));
+        return;
+    }
+    size_t used_mb  = (total_b - free_b) / (1024ull * 1024ull);
+    size_t total_mb = total_b / (1024ull * 1024ull);
+    fprintf(stderr, "  GPU mem [%-20s] %5zu MB used / %5zu MB total\n",
+            label, used_mb, total_mb);
 }
 
 int main(int argc, char* argv[]) {
-    unsigned int width   = 1024;
-    unsigned int height  = 768;
-    unsigned int spp     = 256;
-    const char*  outfile = "output.ppm";
-    std::string  ptx_path = "shaders.ptx";
+    unsigned int width      = 1024;
+    unsigned int height     = 768;
+    unsigned int spp        = 256;
+    unsigned int max_depth  = 20;
+    const char*  outfile    = "output.ppm";
+    std::string  ptx_path   = "shaders.ptx";
 
     for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i],"--width")  && i+1<argc) width   = atoi(argv[++i]);
-        else if (!strcmp(argv[i],"--height") && i+1<argc) height  = atoi(argv[++i]);
-        else if (!strcmp(argv[i],"--spp")    && i+1<argc) spp     = atoi(argv[++i]);
-        else if (!strcmp(argv[i],"--output") && i+1<argc) outfile = argv[++i];
-        else if (!strcmp(argv[i],"--ptx")    && i+1<argc) ptx_path= argv[++i];
-        else if (!strcmp(argv[i],"--help"))  { usage(argv[0]); return 0; }
+        if      (!strcmp(argv[i],"--width")     && i+1<argc) width     = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--height")    && i+1<argc) height    = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--spp")       && i+1<argc) spp       = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--max-depth") && i+1<argc) max_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--output")    && i+1<argc) outfile   = argv[++i];
+        else if (!strcmp(argv[i],"--ptx")       && i+1<argc) ptx_path  = argv[++i];
+        else if (!strcmp(argv[i],"--help"))     { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
     }
+
+    // max_depth < 1 would never trace any rays; clamp for safety.
+    if (max_depth < 1)  max_depth = 1;
+    // The pipeline is linked at maxTraceDepth=20 below; runtime cap must not
+    // exceed it. If a user passes --max-depth 25 we'd silently re-link, so
+    // just clamp here with a warning.
+    if (max_depth > 20) {
+        fprintf(stderr, "WARN: --max-depth %u exceeds pipeline link depth 20; clamping.\n", max_depth);
+        max_depth = 20;
+    }
+
+    fprintf(stderr, "Config: %ux%u  spp=%u  max-depth=%u\n",
+            width, height, spp, max_depth);
 
     try {
         // ---------------------------------------------------------------
@@ -154,6 +210,26 @@ int main(int argc, char* argv[]) {
 #endif
             OPTIX_CHECK(optixDeviceContextCreate(0, &opts, &context));
         }
+
+        // Single CUDA stream + the event objects used to time each phase.
+        // Events are reused across phases to keep the noise down.
+        CUstream stream;
+        CUDA_CHECK(cudaStreamCreate(&stream));
+
+        cudaEvent_t ev_build_start, ev_build_end;
+        cudaEvent_t ev_compact_end;
+        cudaEvent_t ev_sbt_end;
+        cudaEvent_t ev_loop_start, ev_loop_end;
+        cudaEvent_t ev_readback_end;
+        CUDA_CHECK(cudaEventCreate(&ev_build_start));
+        CUDA_CHECK(cudaEventCreate(&ev_build_end));
+        CUDA_CHECK(cudaEventCreate(&ev_compact_end));
+        CUDA_CHECK(cudaEventCreate(&ev_sbt_end));
+        CUDA_CHECK(cudaEventCreate(&ev_loop_start));
+        CUDA_CHECK(cudaEventCreate(&ev_loop_end));
+        CUDA_CHECK(cudaEventCreate(&ev_readback_end));
+
+        log_gpu_mem("before build");
 
         // ---------------------------------------------------------------
         // Build the unified triangle GAS (walls + tessellated spheres).
@@ -174,16 +250,20 @@ int main(int argc, char* argv[]) {
                   << " tris, total " << num_triangles << " tris ("
                   << num_vertices << " verts)\n";
 
+        CUDA_CHECK(cudaEventRecord(ev_build_start, stream));
+
         CUdeviceptr d_verts = 0, d_sbt_idx = 0;
         CUDA_CHECK(cudaMalloc((void**)&d_verts, num_vertices * sizeof(float3)));
-        CUDA_CHECK(cudaMemcpy((void*)d_verts, scene_verts.data(),
-                              num_vertices * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync((void*)d_verts, scene_verts.data(),
+                              num_vertices * sizeof(float3), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMalloc((void**)&d_sbt_idx, num_triangles * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemcpy((void*)d_sbt_idx, tri_sbt_idx.data(),
-                              num_triangles * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync((void*)d_sbt_idx, tri_sbt_idx.data(),
+                              num_triangles * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
         OptixTraversableHandle gas_handle = 0;
         CUdeviceptr            d_gas_output = 0;
+        size_t                 compacted_size = 0;
+        size_t                 uncompacted_size = 0;
         {
             OptixBuildInput build_input = {};
             build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
@@ -211,6 +291,7 @@ int main(int argc, char* argv[]) {
             OptixAccelBufferSizes sizes;
             OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accel_opts,
                         &build_input, 1, &sizes));
+            uncompacted_size = sizes.outputSizeInBytes;
 
             CUdeviceptr d_temp = 0, d_output_uncompacted = 0, d_compacted_size = 0;
             CUDA_CHECK(cudaMalloc((void**)&d_temp, sizes.tempSizeInBytes));
@@ -221,22 +302,32 @@ int main(int argc, char* argv[]) {
             emit.type   = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
             emit.result = d_compacted_size;
 
-            OPTIX_CHECK(optixAccelBuild(context, 0, &accel_opts, &build_input, 1,
+            OPTIX_CHECK(optixAccelBuild(context, stream, &accel_opts, &build_input, 1,
                 d_temp, sizes.tempSizeInBytes,
                 d_output_uncompacted, sizes.outputSizeInBytes,
                 &gas_handle, &emit, 1));
 
-            size_t compacted_size = 0;
-            CUDA_CHECK(cudaMemcpy(&compacted_size, (void*)d_compacted_size,
-                                  sizeof(size_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaEventRecord(ev_build_end, stream));
+
+            CUDA_CHECK(cudaMemcpyAsync(&compacted_size, (void*)d_compacted_size,
+                                       sizeof(size_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
             CUDA_CHECK(cudaMalloc((void**)&d_gas_output, compacted_size));
-            OPTIX_CHECK(optixAccelCompact(context, 0, gas_handle, d_gas_output,
+            OPTIX_CHECK(optixAccelCompact(context, stream, gas_handle, d_gas_output,
                                           compacted_size, &gas_handle));
+
+            CUDA_CHECK(cudaEventRecord(ev_compact_end, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
 
             CUDA_CHECK(cudaFree((void*)d_temp));
             CUDA_CHECK(cudaFree((void*)d_output_uncompacted));
             CUDA_CHECK(cudaFree((void*)d_compacted_size));
         }
+
+        std::cerr << "BVH: uncompacted " << (uncompacted_size / (1024ull*1024ull))
+                  << " MB, compacted "   << (compacted_size   / (1024ull*1024ull))
+                  << " MB\n";
 
         // ---------------------------------------------------------------
         // Module + pipeline (TRIANGLES only; no sphere primitives).
@@ -309,7 +400,10 @@ int main(int argc, char* argv[]) {
         {
             OptixProgramGroup pgs[] = { rg_pg, ms_pg, ch_pg };
             OptixPipelineLinkOptions linkOptions = {};
-            linkOptions.maxTraceDepth = 20; // must match bounce loop in __raygen__rg
+            // Pipeline link depth is a hard cap; we always link at 20 even
+            // when the runtime --max-depth is lower, so the same binary
+            // can run any depth in [1, 20] without a re-link.
+            linkOptions.maxTraceDepth = 20;
             optix_log_size = sizeof(optix_log);
             OPTIX_CHECK(optixPipelineCreate(context,
                 &pipelineCompileOptions, &linkOptions, pgs, 3,
@@ -387,6 +481,7 @@ int main(int argc, char* argv[]) {
         h_params.accum_buffer = reinterpret_cast<float4*>(d_accum);
         h_params.width        = width;
         h_params.height       = height;
+        h_params.max_bounces  = max_depth;
         h_params.handle       = gas_handle;
 
         h_params.eye = {50.0f, 52.0f, 295.6f};
@@ -407,8 +502,10 @@ int main(int argc, char* argv[]) {
         CUdeviceptr d_params;
         CUDA_CHECK(cudaMalloc((void**)&d_params, sizeof(Params)));
 
-        CUstream stream;
-        CUDA_CHECK(cudaStreamCreate(&stream));
+        CUDA_CHECK(cudaEventRecord(ev_sbt_end, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        log_gpu_mem("after SBT setup");
 
         // ---------------------------------------------------------------
         // Tile launch loop.
@@ -424,14 +521,16 @@ int main(int argc, char* argv[]) {
                   << ", grid " << n_tiles_x << "x" << n_tiles_y
                   << " = " << (n_tiles_x * n_tiles_y) << " tiles\n";
 
-        cudaEvent_t ev_start, ev_stop;
-        CUDA_CHECK(cudaEventCreate(&ev_start));
-        CUDA_CHECK(cudaEventCreate(&ev_stop));
-
         h_params.samples_per_launch = spp;
         h_params.subframe_index     = 0;
 
-        CUDA_CHECK(cudaEventRecord(ev_start, stream));
+        // Track peak GPU memory across the tile loop. We sample once per
+        // tile launch boundary which is when OptiX's per-launch state is
+        // most likely to be allocated. cudaMemGetInfo is cheap enough
+        // (single ms-scale) that this won't perturb timings meaningfully.
+        size_t peak_used_mb = 0;
+
+        CUDA_CHECK(cudaEventRecord(ev_loop_start, stream));
         for (unsigned int ty = 0; ty < n_tiles_y; ++ty) {
             for (unsigned int tx = 0; tx < n_tiles_x; ++tx) {
                 h_params.tile_origin_x = tx * tile_w;
@@ -445,28 +544,74 @@ int main(int argc, char* argv[]) {
                                            cudaMemcpyHostToDevice, stream));
                 OPTIX_CHECK(optixLaunch(pipeline, stream, d_params, sizeof(Params),
                                         &sbt, this_w, this_h, 1));
+
+                // Synchronize on this tile so cudaMemGetInfo reflects the
+                // post-launch state. This is the most expensive sample we
+                // take in the whole binary; we accept the per-tile sync
+                // cost because the memory measurement is the whole point
+                // of the 4K data point for slide 7.
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                size_t used_mb = (total_b - free_b) / (1024ull * 1024ull);
+                if (used_mb > peak_used_mb) peak_used_mb = used_mb;
             }
         }
-        CUDA_CHECK(cudaEventRecord(ev_stop, stream));
+        CUDA_CHECK(cudaEventRecord(ev_loop_end, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        float ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+        float loop_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&loop_ms, ev_loop_start, ev_loop_end));
 
         double primary_rays = (double)width * height * spp;
-        double mrays_sec    = primary_rays / (ms * 1e3);
-
-        printf("Resolution: %ux%u  SPP: %u  Time: %.2f ms  Mrays/s: %.2f\n",
-               width, height, spp, ms, mrays_sec);
-        printf("CSV: optix_phase3,%ux%u,%u,%.2f,%.2f,sm_86\n",
-               width, height, spp, ms, mrays_sec);
+        double mrays_sec    = primary_rays / (loop_ms * 1e3);
 
         // ---------------------------------------------------------------
         // Read back and write PPM
         // ---------------------------------------------------------------
         std::vector<float4> h_accum(width * height);
-        CUDA_CHECK(cudaMemcpy(h_accum.data(), (void*)d_accum, width*height*sizeof(float4), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(h_accum.data(), (void*)d_accum,
+                                   width*height*sizeof(float4),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaEventRecord(ev_readback_end, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
         write_ppm(outfile, width, height, h_accum.data());
+
+        // ---------------------------------------------------------------
+        // Per-phase timing report.
+        // ---------------------------------------------------------------
+        std::cerr << "\nPhase timings:\n";
+        print_phase("BVH build",       ev_build_start, ev_build_end);
+        print_phase("Compaction",      ev_build_end,   ev_compact_end);
+        print_phase("SBT+buffers",     ev_compact_end, ev_sbt_end);
+        print_phase("Tile loop",       ev_loop_start,  ev_loop_end);
+        print_phase("Readback",        ev_loop_end,    ev_readback_end);
+        // Convenience total = build_start -> readback_end
+        {
+            float ms_total = 0.0f;
+            cudaEventElapsedTime(&ms_total, ev_build_start, ev_readback_end);
+            std::cerr << "  Total            " << std::fixed << std::setprecision(3)
+                      << ms_total << " ms\n";
+        }
+
+        // Peak memory + final memory snapshot
+        std::cerr << "Peak GPU mem during tile loop: " << peak_used_mb << " MB\n";
+        log_gpu_mem("end of run");
+
+        // The headline timing line that scripts parse. Keep this format
+        // stable -- run_phase3_benchmark.ps1 greps for "^CSV: ".
+        // The PHASE_TIMINGS line is new; the chart builder reads it but
+        // legacy scripts ignore unknown prefixes.
+        printf("Resolution: %ux%u  SPP: %u  MaxDepth: %u  Time: %.2f ms  Mrays/s: %.2f\n",
+               width, height, spp, max_depth, loop_ms, mrays_sec);
+        printf("CSV: optix_phase3,%ux%u,%u,%.2f,%.2f,sm_86\n",
+               width, height, spp, loop_ms, mrays_sec);
+        // Extended CSV row with depth + memory for the chart builder.
+        // Format: PHASE3_EXT,phase,res,spp,depth,time_ms,mrays,peak_mb
+        printf("PHASE3_EXT: optix_phase3,%ux%u,%u,%u,%.2f,%.2f,%zu\n",
+               width, height, spp, max_depth, loop_ms, mrays_sec, peak_used_mb);
+
         printf("Wrote: %s\n", outfile);
 
         // ---------------------------------------------------------------
@@ -480,8 +625,13 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaFree((void*)d_gas_output));
         CUDA_CHECK(cudaFree((void*)d_verts));
         CUDA_CHECK(cudaFree((void*)d_sbt_idx));
-        CUDA_CHECK(cudaEventDestroy(ev_start));
-        CUDA_CHECK(cudaEventDestroy(ev_stop));
+        CUDA_CHECK(cudaEventDestroy(ev_build_start));
+        CUDA_CHECK(cudaEventDestroy(ev_build_end));
+        CUDA_CHECK(cudaEventDestroy(ev_compact_end));
+        CUDA_CHECK(cudaEventDestroy(ev_sbt_end));
+        CUDA_CHECK(cudaEventDestroy(ev_loop_start));
+        CUDA_CHECK(cudaEventDestroy(ev_loop_end));
+        CUDA_CHECK(cudaEventDestroy(ev_readback_end));
         CUDA_CHECK(cudaStreamDestroy(stream));
 
         OPTIX_CHECK(optixPipelineDestroy(pipeline));

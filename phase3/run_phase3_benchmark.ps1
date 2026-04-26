@@ -1,22 +1,25 @@
 # =============================================================================
-# Phase 3 benchmark grid runner
+# Phase 3 benchmark grid runner (v3, deck-prep edition)
 #
-# Adapted from run_phase2_benchmark.ps1. Key differences vs phase 2:
-#   - Points at phase3\build\ for exe + PTX
-#   - Results land in results\phase3_optix_triangles\runs\<timestamp>\
-#   - CSV phase tag is "optix_phase3" (matches the CSV line the exe emits)
-#   - Default config grid is the same quick+full sets; 4K high-SPP is separate
+# Adapted from run_phase2_benchmark.ps1. Differences from the v2 phase 3 runner:
+#   - -MaxDepth N         : pass --max-depth to the exe (uses default 20 if unset)
+#   - -Ablation           : sweep depth in {2,4,6,8,12,20} at the headline
+#                            config (1024x768x1024spp). Writes ablation.csv.
+#   - -AblationDepths     : override the depth sweep list (comma-separated)
+#   - -AblationConfig     : override which (W,H,SPP) the sweep runs at
+#   - -MemLog             : enable nvidia-smi memory logger for 4K configs
+#                            (auto-on for any 4096-named config; -MemLog forces on
+#                             everywhere, -NoMemLog forces off)
+#   - PHASE3_EXT line is parsed if present and adds depth + peak_mb to timings
 #
 # Usage:
 #   cd C:\Users\hudsonre\527project\phase3
 #   powershell -ExecutionPolicy Bypass -File .\run_phase3_benchmark.ps1
 #
-# Options:
-#   -SkipPng       Don't convert PPM -> PNG (faster if you just want timings)
-#   -ConfigFilter  Regex; only run configs whose name matches (e.g. "1024x768")
-#   -Tag           Optional label appended to the run folder name
-#   -Full          Run the full 9-config grid instead of the 3-config quick set
-#   -Mem           Run only the 4K config (memory stress test)
+# Common invocations:
+#   -Full        run the 9-config grid for the deck
+#   -Mem         single 4K_1024spp run with memory logging
+#   -Ablation    sweep --max-depth at 1024x768x1024spp
 # =============================================================================
 
 [CmdletBinding()]
@@ -25,7 +28,13 @@ param(
     [string]$ConfigFilter = "",
     [string]$Tag = "",
     [switch]$Full,
-    [switch]$Mem
+    [switch]$Mem,
+    [switch]$Ablation,
+    [int]$MaxDepth = 0,
+    [string]$AblationDepths = "2,4,6,8,12,20",
+    [string]$AblationConfig = "1024x768_1024spp",
+    [switch]$MemLog,
+    [switch]$NoMemLog
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,7 +54,10 @@ $RunFolder = if ($Tag -ne "") { "${RunStamp}_$Tag" } else { $RunStamp }
 $RunDir    = Join-Path $RunsRoot $RunFolder
 $RendersDir = Join-Path $RunDir "renders"
 $LogsDir    = Join-Path $RunDir "logs"
+$MemLogDir  = Join-Path $RunDir "memlog"
 $CsvPath    = Join-Path $RunDir "timings.csv"
+$ExtCsvPath = Join-Path $RunDir "timings_ext.csv"
+$AblationCsvPath = Join-Path $RunDir "ablation.csv"
 $RunInfoPath = Join-Path $RunDir "run_info.txt"
 
 # -----------------------------------------------------------------------------
@@ -77,15 +89,50 @@ $MemConfigs = @(
     @{ Name = "4096x3072_1024spp"; Width = 4096; Height = 3072; Spp = 1024 }
 )
 
+# Ablation: parse the configs. The depth sweep itself is per-depth.
+function Parse-AblationConfig {
+    param([string]$Spec)
+    # "1024x768_1024spp" -> Width=1024 Height=768 Spp=1024
+    if ($Spec -match '^(\d+)x(\d+)_(\d+)spp$') {
+        return @{
+            Name   = $Spec
+            Width  = [int]$Matches[1]
+            Height = [int]$Matches[2]
+            Spp    = [int]$Matches[3]
+        }
+    }
+    Write-Host "ERROR: bad -AblationConfig '$Spec' (expected like '1024x768_1024spp')" -ForegroundColor Red
+    exit 1
+}
+
 # Pick which set to run
-$Configs = if ($Mem)  { $MemConfigs  }
-      elseif ($Full)  { $FullConfigs }
-      else            { $QuickConfigs }
+if ($Ablation) {
+    # Ablation is special: same config repeated with varying --max-depth.
+    $AblConfig = Parse-AblationConfig $AblationConfig
+    $depths    = $AblationDepths -split ',' | ForEach-Object { [int]$_.Trim() }
+    $Configs = @()
+    foreach ($d in $depths) {
+        $cfgCopy = @{
+            Name      = "$($AblConfig.Name)_d$d"
+            Width     = $AblConfig.Width
+            Height    = $AblConfig.Height
+            Spp       = $AblConfig.Spp
+            MaxDepth  = $d
+        }
+        $Configs += $cfgCopy
+    }
+} elseif ($Mem) {
+    $Configs = $MemConfigs
+} elseif ($Full) {
+    $Configs = $FullConfigs
+} else {
+    $Configs = $QuickConfigs
+}
 
 # -----------------------------------------------------------------------------
 # Sanity checks
 # -----------------------------------------------------------------------------
-Write-Host "=== Phase 3 benchmark runner ===" -ForegroundColor Cyan
+Write-Host "=== Phase 3 benchmark runner (v3) ===" -ForegroundColor Cyan
 Write-Host "Project root: $ProjectRoot"
 Write-Host "Run folder:   $RunDir"
 
@@ -116,11 +163,19 @@ if (-not $SkipPng) {
     }
 }
 
+# Detect whether nvidia-smi is on PATH (for the memory logger)
+$NvidiaSmiAvailable = $false
+try {
+    & cmd.exe /c "where nvidia-smi >NUL 2>NUL"
+    if ($LASTEXITCODE -eq 0) { $NvidiaSmiAvailable = $true }
+} catch { $NvidiaSmiAvailable = $false }
+
 # -----------------------------------------------------------------------------
 # Output dirs + metadata
 # -----------------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $RendersDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogsDir    | Out-Null
+New-Item -ItemType Directory -Force -Path $MemLogDir  | Out-Null
 
 Copy-Item -Path $SceneHPath -Destination (Join-Path $RunDir "scene.h.snapshot") -Force
 
@@ -128,25 +183,86 @@ $gitHash = ""
 try { $gitHash = & git -C $ProjectRoot rev-parse --short HEAD 2>$null } catch {}
 
 @(
-    "Run timestamp: $RunStamp"
-    "Active scene:  $ActiveScene"
-    "Tag:           $Tag"
-    "Exe:           $ExePath"
-    "PTX:           $PtxPath"
-    "Git hash:      $gitHash"
-    "Config set:    $(if ($Mem) {'mem'} elseif ($Full) {'full'} else {'quick'})"
-    "Configs:       $($Configs.Count)"
+    "Run timestamp:   $RunStamp"
+    "Active scene:    $ActiveScene"
+    "Tag:             $Tag"
+    "Exe:             $ExePath"
+    "PTX:             $PtxPath"
+    "Git hash:        $gitHash"
+    "Config set:      $(if ($Ablation){'ablation'} elseif ($Mem){'mem'} elseif ($Full){'full'} else {'quick'})"
+    "Configs:         $($Configs.Count)"
+    "MaxDepth:        $(if ($MaxDepth -gt 0) { $MaxDepth } else { 'default (20)' })"
+    "MemLog:          forced=$($MemLog), suppressed=$($NoMemLog), nvsmi=$NvidiaSmiAvailable"
 ) | Out-File -FilePath $RunInfoPath -Encoding ascii
 
 "phase,scene,resolution,spp,time_ms,mrays_sec,notes,run_timestamp" | Out-File -FilePath $CsvPath -Encoding ascii
+"phase,scene,resolution,spp,max_depth,time_ms,mrays_sec,peak_mb,run_timestamp" | Out-File -FilePath $ExtCsvPath -Encoding ascii
+if ($Ablation) {
+    "max_depth,resolution,spp,time_ms,mrays_sec,peak_mb,run_timestamp" | Out-File -FilePath $AblationCsvPath -Encoding ascii
+}
 
 if ($ConfigFilter -ne "") {
     $Configs = $Configs | Where-Object { $_.Name -match $ConfigFilter }
     Write-Host "Filter '$ConfigFilter' matched $($Configs.Count) config(s)"
 }
 
-Write-Host "Config set:     $(if ($Mem) {'mem'} elseif ($Full) {'full'} else {'quick'}) ($($Configs.Count) configs)"
+Write-Host "Config set:     $(if ($Ablation){'ablation'} elseif ($Mem){'mem'} elseif ($Full){'full'} else {'quick'}) ($($Configs.Count) configs)"
 Write-Host ""
+
+# -----------------------------------------------------------------------------
+# Memory logger helper (background nvidia-smi sampler)
+# -----------------------------------------------------------------------------
+function Should-LogMem {
+    param([string]$ConfigName)
+    if ($NoMemLog)              { return $false }
+    if (-not $NvidiaSmiAvailable) { return $false }
+    if ($MemLog)                { return $true }
+    # Auto-on for any 4K config
+    if ($ConfigName -match '4096') { return $true }
+    return $false
+}
+
+function Start-MemLogger {
+    param([string]$ConfigName, [string]$LogDir)
+    $logPath = Join-Path $LogDir "${ConfigName}_nvsmi.csv"
+    # Sample every 100ms. The query is cheap; output goes straight to CSV.
+    # We use --loop-ms instead of -lms because the latter is older syntax
+    # and not present in all Windows CUDA installs.
+    $args = @(
+        "--query-gpu=timestamp,memory.used,memory.free,utilization.gpu",
+        "--format=csv,noheader,nounits",
+        "--loop-ms=100"
+    )
+    $proc = Start-Process -FilePath "nvidia-smi" -ArgumentList $args `
+        -NoNewWindow -PassThru -RedirectStandardOutput $logPath
+    Start-Sleep -Milliseconds 200  # let it warm up so the first sample lands
+    return @{ Process = $proc; LogPath = $logPath }
+}
+
+function Stop-MemLogger {
+    param($Logger)
+    if ($null -eq $Logger) { return }
+    try {
+        if (-not $Logger.Process.HasExited) {
+            Stop-Process -Id $Logger.Process.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    # Parse the CSV and report peak MB
+    if (Test-Path $Logger.LogPath) {
+        $maxMb = 0
+        Get-Content $Logger.LogPath | ForEach-Object {
+            $cols = $_ -split ',' | ForEach-Object { $_.Trim() }
+            if ($cols.Count -ge 2) {
+                $mb = 0
+                if ([int]::TryParse($cols[1], [ref]$mb)) {
+                    if ($mb -gt $maxMb) { $maxMb = $mb }
+                }
+            }
+        }
+        return $maxMb
+    }
+    return 0
+}
 
 # -----------------------------------------------------------------------------
 # Run loop
@@ -160,11 +276,15 @@ foreach ($cfg in $Configs) {
     $height = $cfg.Height
     $spp    = $cfg.Spp
 
+    # Per-config max-depth (ablation sets this; otherwise use the global -MaxDepth or default)
+    $cfgMaxDepth = if ($cfg.ContainsKey('MaxDepth')) { $cfg.MaxDepth } elseif ($MaxDepth -gt 0) { $MaxDepth } else { 0 }
+
     $ppmPath = Join-Path $RendersDir "$name.ppm"
     $pngPath = Join-Path $RendersDir "$name.png"
     $logPath = Join-Path $LogsDir    "$name.log"
 
-    Write-Host ("--- $name ({0}x{1}, $spp spp) ---" -f $width, $height) -ForegroundColor Yellow
+    $depthDisplay = if ($cfgMaxDepth -gt 0) { "depth=$cfgMaxDepth" } else { "depth=default" }
+    Write-Host ("--- $name ({0}x{1}, $spp spp, $depthDisplay) ---" -f $width, $height) -ForegroundColor Yellow
 
     $cfgStart = Get-Date
 
@@ -175,17 +295,29 @@ foreach ($cfg in $Configs) {
         "--output", $ppmPath,
         "--ptx",    $PtxPath
     )
+    if ($cfgMaxDepth -gt 0) {
+        $exeArgs += @("--max-depth", $cfgMaxDepth)
+    }
 
     @(
         "# Phase 3 benchmark: $name"
         "# Resolution: ${width}x${height}"
         "# SPP: $spp"
+        "# MaxDepth: $cfgMaxDepth"
         "# Run: $RunStamp"
         "# Scene: $ActiveScene"
         "# Git: $gitHash"
         "# Command: $ExePath $($exeArgs -join ' ')"
         "# ---"
     ) | Out-File -FilePath $logPath -Encoding ascii
+
+    # Start memory logger if this config warrants it
+    $memLogger = $null
+    $extPeakMb = 0
+    if (Should-LogMem $name) {
+        Write-Host "  nvsmi memlog enabled" -ForegroundColor DarkGray
+        $memLogger = Start-MemLogger -ConfigName $name -LogDir $MemLogDir
+    }
 
     $stdoutTmp = "$logPath.stdout.tmp"
     $stderrTmp = "$logPath.stderr.tmp"
@@ -194,6 +326,15 @@ foreach ($cfg in $Configs) {
         -NoNewWindow -Wait -PassThru `
         -RedirectStandardOutput $stdoutTmp `
         -RedirectStandardError  $stderrTmp
+
+    # Stop memory logger before parsing logs
+    $nvsmiPeakMb = 0
+    if ($memLogger) {
+        $nvsmiPeakMb = Stop-MemLogger $memLogger
+        if ($nvsmiPeakMb -gt 0) {
+            Write-Host ("  nvsmi peak: $nvsmiPeakMb MB") -ForegroundColor DarkGray
+        }
+    }
 
     Add-Content -Path $logPath -Value "## stderr (OptiX log + diagnostics)"
     if (Test-Path $stderrTmp) { Get-Content $stderrTmp | Add-Content -Path $logPath }
@@ -211,7 +352,7 @@ foreach ($cfg in $Configs) {
         continue
     }
 
-    # Parse "CSV: optix_phase3,1024x768,256,499.99,471.86,sm_86"
+    # Parse "CSV: optix_phase3,1024x768,256,499.99,471.86,sm_86"  (legacy line)
     $csvLine = Select-String -Path $logPath -Pattern "^CSV: " | Select-Object -Last 1
     if ($csvLine) {
         $payload = $csvLine.Line.Substring(5).Trim()
@@ -223,11 +364,45 @@ foreach ($cfg in $Configs) {
             Write-Host "  Logged to timings.csv" -ForegroundColor Green
         } else {
             "$payload,$RunStamp" | Out-File -FilePath $CsvPath -Append -Encoding ascii
-            Write-Host "  Logged to timings.csv (unparsed)" -ForegroundColor Green
         }
     } else {
         Write-Host "  WARN: no CSV line found in exe output" -ForegroundColor Yellow
         $failures += @{ Config = $name; Reason = "no CSV line in output" }
+    }
+
+    # Parse "PHASE3_EXT: optix_phase3,1024x768,256,20,499.99,471.86,1234"  (new ext line)
+    $extLine = Select-String -Path $logPath -Pattern "^PHASE3_EXT: " | Select-Object -Last 1
+    if ($extLine) {
+        $payload = $extLine.Line.Substring(12).Trim()
+        $parts = $payload -split ','
+        if ($parts.Count -ge 7) {
+            $phase    = $parts[0]
+            $res      = $parts[1]
+            $sppEx    = $parts[2]
+            $depthEx  = $parts[3]
+            $timeEx   = $parts[4]
+            $mraysEx  = $parts[5]
+            $peakEx   = $parts[6]
+            $extPeakMb = [int]$peakEx
+            "$phase,$ActiveScene,$res,$sppEx,$depthEx,$timeEx,$mraysEx,$peakEx,$RunStamp" |
+                Out-File -FilePath $ExtCsvPath -Append -Encoding ascii
+
+            # If this is an ablation run, also append to ablation.csv
+            if ($Ablation) {
+                "$depthEx,$res,$sppEx,$timeEx,$mraysEx,$peakEx,$RunStamp" |
+                    Out-File -FilePath $AblationCsvPath -Append -Encoding ascii
+            }
+        }
+    }
+
+    # If we have both an exe-internal peak and an nvsmi peak, take the max.
+    # nvsmi sees the full process VRAM (including driver overhead the exe
+    # doesn't see), so its number is usually a few hundred MB higher and
+    # is the right one for the slide. Internal peak is ground truth for
+    # what *our code* allocated.
+    $reportedPeak = [Math]::Max($extPeakMb, $nvsmiPeakMb)
+    if ($reportedPeak -gt 0) {
+        Write-Host ("  Peak: {0} MB (exe={1}, nvsmi={2})" -f $reportedPeak, $extPeakMb, $nvsmiPeakMb) -ForegroundColor DarkGray
     }
 
     if (-not $SkipPng) {
@@ -272,3 +447,15 @@ if ($failures.Count -gt 0) {
 Write-Host ""
 Write-Host "Timings:" -ForegroundColor Cyan
 Get-Content $CsvPath | ForEach-Object { Write-Host "  $_" }
+
+if (Test-Path $ExtCsvPath) {
+    Write-Host ""
+    Write-Host "Extended timings (with depth + peak_mb):" -ForegroundColor Cyan
+    Get-Content $ExtCsvPath | ForEach-Object { Write-Host "  $_" }
+}
+
+if ($Ablation) {
+    Write-Host ""
+    Write-Host "Ablation:" -ForegroundColor Cyan
+    Get-Content $AblationCsvPath | ForEach-Object { Write-Host "  $_" }
+}

@@ -1,5 +1,14 @@
 # =============================================================================
-# Nsight Compute runner for phase 2/3 A/B comparison.
+# Nsight Compute runner for phase 2/3 A/B comparison (v3, deck-prep).
+#
+# Differences vs v2:
+#   - Metric set replaced with one that supports an empirical arithmetic
+#     intensity calculation: FLOP counters (FFMA, FADD, FMUL) + DRAM bytes.
+#   - -ApplicationReplay switch tries `--replay-mode application` to
+#     potentially capture the real raygen kernel name on Ampere instead of
+#     the deprecated-launcher wrapper. See rationale below.
+#   - Quick-mode output now includes a derived "FLOPs/byte" line and
+#     dumps a slim summary CSV alongside the raw ncu CSV for chart use.
 #
 # Captures the metrics and full-set reports needed for the deck.
 #
@@ -26,10 +35,12 @@
 #
 # Fix: set OPTIX_FORCE_DEPRECATED_LAUNCHER=1 in the environment when
 # launching the application under ncu. This forces OptiX to use its older
-# launch path which ncu *does* see. Side effect: Shader Execution Reordering
-# (SER) is disabled while this is set -- but SER is Ada+ only and the
-# RTX 3080 Ti is Ampere, so this changes nothing on this machine. For Ada+
-# users this matters and SER metrics need a different capture strategy.
+# launch path which ncu *does* see, but names the kernel `optixLaunch`
+# (the launcher wrapper) rather than `__raygen__rg`. Side effect: Shader
+# Execution Reordering (SER) is disabled while this is set -- but SER is
+# Ada+ only and the RTX 3080 Ti is Ampere, so this changes nothing on
+# this machine. Profiling caveat: PC-sampling stalls come back `n/a` in
+# this mode; that's a known limitation of the deprecated launcher capture.
 #
 # Source: NVIDIA OptiX engineer "droettger" on the NVIDIA dev forums.
 #   https://forums.developer.nvidia.com/t/need-help-profiling-an-optix-application/265266
@@ -37,8 +48,16 @@
 #   https://docs.nvidia.com/nsight-compute/ReleaseNotes/topics/library-support-optix.html
 #
 # This script sets OPTIX_FORCE_DEPRECATED_LAUNCHER=1 only for the duration
-# of each ncu invocation, via Start-Process -Environment. It does NOT
-# pollute the parent shell or persist after the script exits.
+# of each ncu invocation. It does NOT pollute the parent shell or persist
+# after the script exits.
+#
+# -ApplicationReplay attempts an alternative capture mode where ncu re-runs
+# the whole application per metric pass instead of per-kernel replay. On
+# some setups this lets the modern launcher succeed and gives raygen its
+# real name. We try it for the deck because raygen-named metrics (with
+# pc-sampling stalls populated) would be a much better slide. If it
+# doesn't work, the script falls back gracefully and we ship with the
+# deprecated-launcher caveat.
 # =============================================================================
 #
 # REQUIREMENTS:
@@ -54,8 +73,9 @@
 #   - Python with Pillow on PATH for PPM->PNG conversion (or pass -SkipPng).
 #
 # MODES:
-#   quick (default) - one targeted-metrics capture on 1024x768_64spp.
-#                     ~30-90s wall time. Output: <config>_metrics.csv.
+#   quick (default) - one targeted-metrics capture on 1024x768_512spp.
+#                     ~30-90s wall time. Output: <config>_metrics.csv
+#                     plus a derived <config>_summary.csv with AI numbers.
 #   full            - --set full capture on 3 configs.
 #                     ~5-15 min wall time per config. Output: <config>_full.ncu-rep
 #                     plus a parsed summary CSV. Open .ncu-rep in the Nsight
@@ -82,10 +102,18 @@ param(
     [string]$NcuPath = "ncu",
 
     # Regex passed to ncu --kernel-name. Default matches any kernel whose
-    # name contains "raygen" (case insensitive). The OptiX docs say
-    # kernel names start with "raygen__" -- we match the substring so
-    # any user-defined raygen entry is captured.
-    [string]$KernelNameRegex = "regex:(?i)raygen",
+    # name contains "raygen" or "optixLaunch" (case insensitive). On Ampere
+    # with the deprecated launcher, "optixLaunch" is what comes through.
+    [string]$KernelNameRegex = "regex:(?i)(raygen|optixLaunch)",
+
+    # Try application-replay mode. On some setups this captures the modern
+    # launcher and gives raygen its real name. If it fails or returns no
+    # kernels, fall back to the standard kernel-replay path.
+    [switch]$ApplicationReplay,
+
+    # Skip the deprecated-launcher env var. Only useful with -ApplicationReplay
+    # since application replay sometimes works with the modern launcher path.
+    [switch]$SkipDeprecatedLauncher,
 
     [switch]$SkipPng,
 
@@ -147,15 +175,22 @@ if ($PngEnabled) {
 # -----------------------------------------------------------------------------
 $EnvVarName = "OPTIX_FORCE_DEPRECATED_LAUNCHER"
 $priorEnv = [System.Environment]::GetEnvironmentVariable($EnvVarName, "Process")
-[System.Environment]::SetEnvironmentVariable($EnvVarName, "1", "Process")
-Write-Host "Env: $EnvVarName=1 (process-scoped, restored on exit)" -ForegroundColor DarkGray
+if (-not $SkipDeprecatedLauncher) {
+    [System.Environment]::SetEnvironmentVariable($EnvVarName, "1", "Process")
+    Write-Host "Env: $EnvVarName=1 (process-scoped, restored on exit)" -ForegroundColor DarkGray
+} else {
+    Write-Host "Env: $EnvVarName NOT set (-SkipDeprecatedLauncher)" -ForegroundColor DarkGray
+}
 
 # -----------------------------------------------------------------------------
 # Run folder
 # -----------------------------------------------------------------------------
 if ($RunDir -eq "") {
     $RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $RunDir = Join-Path $ScriptDir "results\nsight\${RunStamp}_${Variant}"
+    $tagSuffix = ""
+    if ($ApplicationReplay) { $tagSuffix += "_appreplay" }
+    if ($SkipDeprecatedLauncher) { $tagSuffix += "_modern" }
+    $RunDir = Join-Path $ScriptDir "results\nsight\${RunStamp}_${Variant}${tagSuffix}"
 }
 $NsightDir  = Join-Path $RunDir "nsight"
 $RendersDir = Join-Path $RunDir "renders"
@@ -163,13 +198,15 @@ New-Item -ItemType Directory -Force -Path $NsightDir  | Out-Null
 New-Item -ItemType Directory -Force -Path $RendersDir | Out-Null
 
 Write-Host "=== Nsight Compute capture ===" -ForegroundColor Cyan
-Write-Host "Variant:     $Variant"
-Write-Host "Mode:        $Mode"
-Write-Host "Exe:         $ExePath"
-Write-Host "PTX:         $PtxPath"
-Write-Host "Kernel:      $KernelNameRegex"
-Write-Host "Output:      $NsightDir"
-Write-Host "Renders:     $RendersDir"
+Write-Host "Variant:           $Variant"
+Write-Host "Mode:              $Mode"
+Write-Host "ApplicationReplay: $ApplicationReplay"
+Write-Host "DeprLauncher:      $(-not $SkipDeprecatedLauncher)"
+Write-Host "Exe:               $ExePath"
+Write-Host "PTX:               $PtxPath"
+Write-Host "Kernel:            $KernelNameRegex"
+Write-Host "Output:            $NsightDir"
+Write-Host "Renders:           $RendersDir"
 Write-Host ""
 
 # Snapshot scene.h and git hash if available
@@ -194,10 +231,11 @@ try {
     "Nsight capture timestamp:          $(Get-Date -Format 'o')"
     "Variant:                           $Variant"
     "Mode:                              $Mode"
+    "ApplicationReplay:                 $ApplicationReplay"
     "Exe:                               $ExePath"
     "PTX:                               $PtxPath"
     "Kernel filter:                     $KernelNameRegex"
-    "OPTIX_FORCE_DEPRECATED_LAUNCHER:   1"
+    "OPTIX_FORCE_DEPRECATED_LAUNCHER:   $(if ($SkipDeprecatedLauncher) {'NOT SET'} else {'1'})"
     "Host:                              $env:COMPUTERNAME"
     "User:                              $env:USERNAME"
 ) | Out-File -FilePath (Join-Path $NsightDir "info.txt") -Encoding ascii
@@ -207,7 +245,7 @@ try {
 # -----------------------------------------------------------------------------
 if ($Mode -eq "quick") {
     $Configs = @(
-        @{ Name = "1024x768_64spp"; Width = 1024; Height = 768; Spp = 64 }
+        @{ Name = "1024x768_512spp"; Width = 1024; Height = 768; Spp = 512 }
     )
 } else {
     $Configs = @(
@@ -217,18 +255,39 @@ if ($Mode -eq "quick") {
     )
 }
 
+# Metrics for the deck. Why each one is here:
+#
+#   gpu__time_duration.sum                                    : kernel time
+#   sm__throughput.avg.pct_of_peak_sustained_elapsed          : SM utilization
+#   smsp__warps_active.avg.pct_of_peak_sustained_active       : occupancy
+#   smsp__thread_inst_executed_per_inst_executed.ratio        : divergence (24/32 = 75%)
+#   dram__throughput.avg.pct_of_peak_sustained_elapsed        : DRAM utilization (memory pressure)
+#   dram__bytes.sum                                           : actual bytes hit DRAM (denominator for AI)
+#   l1tex__throughput.avg.pct_of_peak_sustained_active        : L1/TEX pressure
+#   lts__t_sectors.sum / lts__t_sectors_lookup_hit.sum        : L2 hit rate
+#   sm__inst_executed_pipe_xu.avg.pct_of_peak_sustained_active: transcendental pipe usage
+#   smsp__pcsamp_warps_issue_stalled_long_scoreboard.avg.*    : memory stall reason (n/a in deprecated launcher)
+#   smsp__pcsamp_warps_issue_stalled_short_scoreboard.avg.*   : compute stall reason (n/a in deprecated launcher)
+#   smsp__sass_thread_inst_executed_op_ffma_pred_on.sum       : FFMA = 2 FLOPs/inst (numerator for AI)
+#   smsp__sass_thread_inst_executed_op_fadd_pred_on.sum       : FADD = 1 FLOP/inst
+#   smsp__sass_thread_inst_executed_op_fmul_pred_on.sum       : FMUL = 1 FLOP/inst
+#
 $Metrics = @(
     "gpu__time_duration.sum",
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "smsp__warps_active.avg.pct_of_peak_sustained_active",
     "smsp__thread_inst_executed_per_inst_executed.ratio",
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__bytes.sum",
     "l1tex__throughput.avg.pct_of_peak_sustained_active",
     "lts__t_sectors_lookup_hit.sum",
     "lts__t_sectors.sum",
     "sm__inst_executed_pipe_xu.avg.pct_of_peak_sustained_active",
     "smsp__pcsamp_warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_active",
-    "smsp__pcsamp_warps_issue_stalled_short_scoreboard.avg.pct_of_peak_sustained_active"
+    "smsp__pcsamp_warps_issue_stalled_short_scoreboard.avg.pct_of_peak_sustained_active",
+    "smsp__sass_thread_inst_executed_op_ffma_pred_on.sum",
+    "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum",
+    "smsp__sass_thread_inst_executed_op_fmul_pred_on.sum"
 ) -join ","
 
 # -----------------------------------------------------------------------------
@@ -241,6 +300,41 @@ function Convert-PpmToPng {
     $pyCmdEscaped = $pyCmd.Replace('"', '\"')
     & cmd.exe /c "python -c `"$pyCmdEscaped`" >NUL 2>NUL"
     return ($LASTEXITCODE -eq 0)
+}
+
+# Helper: parse a numeric metric value out of the ncu CSV. Returns 0 on miss.
+# The CSV from ncu has columns: ID, Process ID, ..., Metric Name, Metric Unit, Metric Value
+# We sum across rows (multiple kernel invocations contribute multiple rows).
+function Parse-MetricSum {
+    param([string]$CsvPath, [string]$MetricName)
+    if (-not (Test-Path $CsvPath)) { return 0.0 }
+
+    $lines = Get-Content $CsvPath
+    $headerIdx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^"ID"') { $headerIdx = $i; break }
+    }
+    if ($headerIdx -lt 0) { return 0.0 }
+
+    $hdr = [regex]::Split($lines[$headerIdx], '","') | ForEach-Object { $_.Trim('"') }
+    $nameCol  = [Array]::IndexOf($hdr, 'Metric Name')
+    $valueCol = [Array]::IndexOf($hdr, 'Metric Value')
+    if ($nameCol -lt 0 -or $valueCol -lt 0) { return 0.0 }
+
+    $sum = 0.0
+    for ($i = $headerIdx + 1; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if (-not ($line -match '^"\d+"')) { continue }
+        $f = [regex]::Split($line, '","') | ForEach-Object { $_.Trim('"') }
+        if ($f.Count -le $valueCol) { continue }
+        if ($f[$nameCol] -ne $MetricName) { continue }
+
+        # Strip thousand separators ("13,701,348,177") that ncu emits with --csv
+        $raw = $f[$valueCol] -replace ',', ''
+        $val = 0.0
+        if ([double]::TryParse($raw, [ref]$val)) { $sum += $val }
+    }
+    return $sum
 }
 
 # -----------------------------------------------------------------------------
@@ -274,12 +368,14 @@ foreach ($cfg in $Configs) {
         $outCsv = Join-Path $NsightDir "${name}_metrics.csv"
         $ncuArgs = @(
             "--metrics", $Metrics,
-            "--kernel-name", $KernelNameRegex,
+            "--kernel-name", "`"$KernelNameRegex`"",
             "--csv",
-            "--target-processes", "all",
-            "--",
-            $ExePath
-        ) + $appArgs
+            "--target-processes", "all"
+        )
+        if ($ApplicationReplay) {
+            $ncuArgs += @("--replay-mode", "application")
+        }
+        $ncuArgs += @("--", $ExePath) + $appArgs
 
         Write-Host "  ncu $($ncuArgs -join ' ')" -ForegroundColor DarkGray
         if ($DryRun) { Write-Host "  (dry run -- skipping)" -ForegroundColor DarkGray; continue }
@@ -287,6 +383,11 @@ foreach ($cfg in $Configs) {
         $cfgStart = Get-Date
         $stderrTmp = "$outCsv.stderr.tmp"
         $stdoutTmp = "$outCsv.stdout.tmp"
+        if (-not $SkipDeprecatedLauncher) {
+            $env:OPTIX_FORCE_DEPRECATED_LAUNCHER = "1"
+        } else {
+            Remove-Item Env:\OPTIX_FORCE_DEPRECATED_LAUNCHER -ErrorAction SilentlyContinue
+        }
         $proc = Start-Process -FilePath $NcuPath -ArgumentList $ncuArgs `
             -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $stdoutTmp `
@@ -318,9 +419,12 @@ foreach ($cfg in $Configs) {
         $csvRaw = Get-Content $outCsv -Raw
         if ($csvRaw -match 'No kernels were profiled') {
             Write-Host "  FAILED: ncu reports 'No kernels were profiled'." -ForegroundColor Red
-            Write-Host "         OPTIX_FORCE_DEPRECATED_LAUNCHER may not have been picked up." -ForegroundColor Red
-            Write-Host "         Verify in info.txt that the env var was set; if so, this may need" -ForegroundColor Red
-            Write-Host "         OptixModuleCompileOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MODERATE in main.cpp." -ForegroundColor Red
+            if ($ApplicationReplay) {
+                Write-Host "         Application replay didn't capture either. Try without -ApplicationReplay." -ForegroundColor Red
+            } else {
+                Write-Host "         OPTIX_FORCE_DEPRECATED_LAUNCHER may not have been picked up." -ForegroundColor Red
+                Write-Host "         Try -ApplicationReplay or set OptixModuleCompileOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MODERATE in main.cpp." -ForegroundColor Red
+            }
             $failures += @{ Config = $name; Reason = "ncu: no kernels profiled" }
             continue
         }
@@ -338,13 +442,21 @@ foreach ($cfg in $Configs) {
             $failures += @{ Config = $name; Reason = "malformed CSV (no header)" }
             continue
         }
+        $headerFields = [regex]::Split($csvLines[$headerIdx], '","')
+        $headerFields = $headerFields | ForEach-Object { $_.Trim('"') }
+        $knCol = [Array]::IndexOf($headerFields, 'Kernel Name')
+        if ($knCol -lt 0) {
+            Write-Host "  FAILED: 'Kernel Name' column not found in CSV header." -ForegroundColor Red
+            $failures += @{ Config = $name; Reason = "no Kernel Name column" }
+            continue
+        }
         $kernelNames = @{}
         for ($i = $headerIdx + 1; $i -lt $csvLines.Count; $i++) {
             $line = $csvLines[$i]
             if ($line -match '^"\d+"') {
-                $fields = $line.TrimStart('"').Split('","', [StringSplitOptions]::None)
-                if ($fields.Count -ge 5) {
-                    $kn = $fields[4]
+                $fields = [regex]::Split($line, '","') | ForEach-Object { $_.Trim('"') }
+                if ($fields.Count -gt $knCol) {
+                    $kn = $fields[$knCol]
                     if (-not $kernelNames.ContainsKey($kn)) { $kernelNames[$kn] = 0 }
                     $kernelNames[$kn]++
                 }
@@ -358,48 +470,107 @@ foreach ($cfg in $Configs) {
         }
 
         Write-Host "  Kernels profiled:" -ForegroundColor DarkGray
+        $sawRaygenName = $false
         foreach ($kn in $kernelNames.Keys) {
             Write-Host ("    {0,-50}  {1} metrics" -f $kn, $kernelNames[$kn]) -ForegroundColor DarkGray
+            if ($kn -match '(?i)raygen') { $sawRaygenName = $true }
         }
 
         $hasRaygen = $false
         foreach ($kn in $kernelNames.Keys) {
-            if ($kn -match '(?i)raygen') { $hasRaygen = $true; break }
+            if ($kn -match '(?i)(raygen|optixLaunch)') { $hasRaygen = $true; break }
         }
         if (-not $hasRaygen) {
-            Write-Host "  FAILED: no raygen kernel in profiled set." -ForegroundColor Red
+            Write-Host "  FAILED: no raygen/optixLaunch kernel in profiled set." -ForegroundColor Red
             Write-Host "         The kernel-name filter '$KernelNameRegex' didn't match anything." -ForegroundColor Red
             Write-Host "         Try -KernelNameRegex 'regex:.*' to capture all kernels and inspect names." -ForegroundColor Red
             $failures += @{ Config = $name; Reason = "no raygen kernel profiled" }
             continue
         }
 
-        $occLine = $csvLines | Where-Object { $_ -match 'warps_active' } | Select-Object -First 1
-        if ($occLine) {
-            $occFields = $occLine.TrimStart('"').Split('","', [StringSplitOptions]::None)
-            if ($occFields.Count -ge 1) {
-                $occVal = $occFields[$occFields.Count - 1].TrimEnd('"')
-                if ($occVal -eq 'n/a' -or $occVal -eq '') {
-                    Write-Host "  WARN: warps_active value is '$occVal'." -ForegroundColor Yellow
-                } else {
-                    Write-Host "  Sanity: warps_active = $occVal" -ForegroundColor DarkGray
-                }
-            }
+        if ($sawRaygenName) {
+            Write-Host "  GREAT: real raygen kernel name captured (not just optixLaunch). pc-sampling stalls should be populated." -ForegroundColor Green
+        } else {
+            Write-Host "  Note: kernel is named 'optixLaunch' (deprecated launcher wrapper). pc-sampling stalls will be n/a." -ForegroundColor DarkGray
         }
+
+        # ---------------------------------------------------------------
+        # Derive arithmetic intensity and a small summary CSV.
+        # ---------------------------------------------------------------
+        $ffma   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_ffma_pred_on.sum'
+        $fadd   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fadd_pred_on.sum'
+        $fmul   = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__sass_thread_inst_executed_op_fmul_pred_on.sum'
+        $bytes  = Parse-MetricSum -CsvPath $outCsv -MetricName 'dram__bytes.sum'
+        $timeNs = Parse-MetricSum -CsvPath $outCsv -MetricName 'gpu__time_duration.sum'
+        $smThr  = Parse-MetricSum -CsvPath $outCsv -MetricName 'sm__throughput.avg.pct_of_peak_sustained_elapsed'
+        $dramThr= Parse-MetricSum -CsvPath $outCsv -MetricName 'dram__throughput.avg.pct_of_peak_sustained_elapsed'
+        $occup  = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__warps_active.avg.pct_of_peak_sustained_active'
+        $diverg = Parse-MetricSum -CsvPath $outCsv -MetricName 'smsp__thread_inst_executed_per_inst_executed.ratio'
+
+        # FLOPs = 2*FFMA + FADD + FMUL  (ncu reports already summed across threads)
+        $flops = (2.0 * $ffma) + $fadd + $fmul
+        $ai    = if ($bytes -gt 0) { $flops / $bytes } else { 0 }
+        # GFLOP/s = FLOPs / time (s)
+        $gflopsps = if ($timeNs -gt 0) { $flops / ($timeNs * 1e-9) / 1e9 } else { 0 }
+        # GB/s
+        $gbps = if ($timeNs -gt 0) { $bytes / ($timeNs * 1e-9) / 1e9 } else { 0 }
+
+        Write-Host "" -ForegroundColor DarkGray
+        Write-Host "  --- Derived metrics (SUM across all profiled kernels) ---" -ForegroundColor Cyan
+        Write-Host ("    FFMA       : {0:N0}" -f $ffma) -ForegroundColor DarkGray
+        Write-Host ("    FADD       : {0:N0}" -f $fadd) -ForegroundColor DarkGray
+        Write-Host ("    FMUL       : {0:N0}" -f $fmul) -ForegroundColor DarkGray
+        Write-Host ("    FLOPs      : {0:N0}  (= 2*FFMA + FADD + FMUL)" -f $flops) -ForegroundColor DarkGray
+        Write-Host ("    DRAM bytes : {0:N0}" -f $bytes) -ForegroundColor DarkGray
+        Write-Host ("    Time (ms)  : {0:N3}" -f ($timeNs * 1e-6)) -ForegroundColor DarkGray
+        Write-Host ("    Arith Int  : {0:F3} FLOP/byte  (SM-side only; excludes RT-core work)" -f $ai) -ForegroundColor Green
+        Write-Host ("    Throughput : {0:N1} GFLOP/s, {1:N1} GB/s" -f $gflopsps, $gbps) -ForegroundColor Green
+        Write-Host ("    SM%/DRAM%  : {0:N2}% SM   /   {1:N2}% DRAM" -f $smThr, $dramThr) -ForegroundColor DarkGray
+        Write-Host ("    Occupancy  : {0:N2}% warps active" -f $occup) -ForegroundColor DarkGray
+        Write-Host ("    Divergence : {0:N3} threads/warp inst (32 = perfect)" -f $diverg) -ForegroundColor DarkGray
+        Write-Host ""
+
+        # Write a slim summary CSV alongside the raw ncu output.
+        $sumPath = Join-Path $NsightDir "${name}_summary.csv"
+        @(
+            "metric,value,unit"
+            "variant,$Variant,"
+            "config,$name,"
+            "ffma_count,$ffma,inst"
+            "fadd_count,$fadd,inst"
+            "fmul_count,$fmul,inst"
+            "flops_total,$flops,FLOPs"
+            "dram_bytes,$bytes,bytes"
+            "time_ns,$timeNs,ns"
+            "arithmetic_intensity,$ai,FLOP/byte"
+            "throughput_gflopsps,$gflopsps,GFLOP/s"
+            "throughput_gbps,$gbps,GB/s"
+            "sm_throughput_pct,$smThr,%"
+            "dram_throughput_pct,$dramThr,%"
+            "warps_active_pct,$occup,%"
+            "divergence_ratio,$diverg,threads/inst"
+            "raygen_kernel_named,$sawRaygenName,bool"
+        ) | Out-File -FilePath $sumPath -Encoding ascii
+        Write-Host "  Summary: $sumPath" -ForegroundColor Green
+
         Write-Host "  OK: $outCsv" -ForegroundColor Green
 
     } else {
-        # full mode
+        # ---------------------------------------------------------------
+        # full mode: --set full
+        # ---------------------------------------------------------------
         $outRep = Join-Path $NsightDir "${name}_full.ncu-rep"
         $ncuArgs = @(
             "--set", "full",
-            "--kernel-name", $KernelNameRegex,
+            "--kernel-name", "`"$KernelNameRegex`"",
             "--target-processes", "all",
             "--export", $outRep,
-            "--force-overwrite",
-            "--",
-            $ExePath
-        ) + $appArgs
+            "--force-overwrite"
+        )
+        if ($ApplicationReplay) {
+            $ncuArgs += @("--replay-mode", "application")
+        }
+        $ncuArgs += @("--", $ExePath) + $appArgs
 
         Write-Host "  ncu $($ncuArgs -join ' ')" -ForegroundColor DarkGray
         if ($DryRun) { Write-Host "  (dry run -- skipping)" -ForegroundColor DarkGray; continue }
@@ -407,6 +578,11 @@ foreach ($cfg in $Configs) {
         $cfgStart = Get-Date
         $stderrTmp = "$outRep.stderr.tmp"
         $stdoutTmp = "$outRep.stdout.tmp"
+        if (-not $SkipDeprecatedLauncher) {
+            $env:OPTIX_FORCE_DEPRECATED_LAUNCHER = "1"
+        } else {
+            Remove-Item Env:\OPTIX_FORCE_DEPRECATED_LAUNCHER -ErrorAction SilentlyContinue
+        }
         $proc = Start-Process -FilePath $NcuPath -ArgumentList $ncuArgs `
             -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $stdoutTmp `
@@ -418,12 +594,10 @@ foreach ($cfg in $Configs) {
         $cfgElapsed = (Get-Date) - $cfgStart
         Write-Host ("  Wall time: {0:N1}s" -f $cfgElapsed.TotalSeconds)
 
-        # Detect 'no kernels profiled' first, regardless of exit code.
         if (Test-Path "$outRep.stdout.log") {
             $stdoutContent = Get-Content "$outRep.stdout.log" -Raw
             if ($stdoutContent -match 'No kernels were profiled') {
                 Write-Host "  FAILED: ncu reports 'No kernels were profiled'." -ForegroundColor Red
-                Write-Host "         OPTIX_FORCE_DEPRECATED_LAUNCHER may not have been picked up." -ForegroundColor Red
                 $failures += @{ Config = $name; Reason = "ncu: no kernels profiled" }
                 continue
             }
@@ -450,7 +624,6 @@ foreach ($cfg in $Configs) {
 
         if ($sizeMB -lt 5.0) {
             Write-Host "  WARN: report unusually small ($sizeMB MB). The kernel-name filter may not have matched raygen." -ForegroundColor Yellow
-            Write-Host "        Quick check: run with -Mode quick first; it lists which kernels were profiled." -ForegroundColor Yellow
         }
 
         # Export a CSV summary for diffing.
@@ -474,8 +647,8 @@ foreach ($cfg in $Configs) {
 
         if (Test-Path $outSummary) {
             $sumContent = Get-Content $outSummary -Raw
-            if ($sumContent -notmatch '(?i)raygen') {
-                Write-Host "  FAILED: summary CSV has no raygen mention." -ForegroundColor Red
+            if ($sumContent -notmatch '(?i)(raygen|optixLaunch)') {
+                Write-Host "  FAILED: summary CSV has no raygen/optixLaunch mention." -ForegroundColor Red
                 $failures += @{ Config = $name; Reason = "raygen absent from full report" }
                 continue
             }
@@ -507,10 +680,12 @@ foreach ($cfg in $Configs) {
 }
 
 } finally {
-    # Restore the env var
+    # Restore the env var (both $env: and the process-level variable).
     if ($null -eq $priorEnv) {
+        Remove-Item Env:\OPTIX_FORCE_DEPRECATED_LAUNCHER -ErrorAction SilentlyContinue
         [System.Environment]::SetEnvironmentVariable($EnvVarName, $null, "Process")
     } else {
+        $env:OPTIX_FORCE_DEPRECATED_LAUNCHER = $priorEnv
         [System.Environment]::SetEnvironmentVariable($EnvVarName, $priorEnv, "Process")
     }
 }
