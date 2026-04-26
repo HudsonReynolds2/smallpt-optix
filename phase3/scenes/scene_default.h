@@ -14,10 +14,12 @@
 #include <cmath>
 
 #ifndef SPHERE_TESS_LAT
-#define SPHERE_TESS_LAT 64
+//#define SPHERE_TESS_LAT 64
+#define SPHERE_TESS_LAT 256
 #endif
 #ifndef SPHERE_TESS_LON
-#define SPHERE_TESS_LON 64
+//#define SPHERE_TESS_LON 64
+#define SPHERE_TESS_LON 256
 #endif
 
 // (Wall tessellation explanation preserved from phase 2 below.)
