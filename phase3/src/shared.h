@@ -17,6 +17,8 @@ struct HitGroupData {
     float3       emission;
     float3       albedo;
     MaterialType material;
+    int          is_sphere;     // 1 for tessellated sphere records, 0 for walls
+    float3       sphere_center; // analytic center for smooth normals (zero for walls)
 };
 
 // Miss SBT data (nothing needed, background is black)

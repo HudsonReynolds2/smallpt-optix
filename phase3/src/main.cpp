@@ -347,16 +347,20 @@ int main(int argc, char* argv[]) {
 
             for (int w = 0; w < NUM_WALLS; ++w) {
                 OPTIX_CHECK(optixSbtRecordPackHeader(ch_pg, &hg_recs[w]));
-                hg_recs[w].data.emission = g_walls[w].emission;
-                hg_recs[w].data.albedo   = g_walls[w].albedo;
-                hg_recs[w].data.material = g_walls[w].material;
+                hg_recs[w].data.emission      = g_walls[w].emission;
+                hg_recs[w].data.albedo        = g_walls[w].albedo;
+                hg_recs[w].data.material      = g_walls[w].material;
+                hg_recs[w].data.is_sphere     = 0;
+                hg_recs[w].data.sphere_center = {0.f, 0.f, 0.f};
             }
             for (int s = 0; s < NUM_SPHERES; ++s) {
                 int idx = NUM_WALLS + s;
                 OPTIX_CHECK(optixSbtRecordPackHeader(ch_pg, &hg_recs[idx]));
-                hg_recs[idx].data.emission = g_spheres[s].emission;
-                hg_recs[idx].data.albedo   = g_spheres[s].albedo;
-                hg_recs[idx].data.material = g_spheres[s].material;
+                hg_recs[idx].data.emission      = g_spheres[s].emission;
+                hg_recs[idx].data.albedo        = g_spheres[s].albedo;
+                hg_recs[idx].data.material      = g_spheres[s].material;
+                hg_recs[idx].data.is_sphere     = 1;
+                hg_recs[idx].data.sphere_center = g_spheres[s].center;
             }
 
             CUDA_CHECK(cudaMalloc((void**)&d_hg_records, NUM_HG_RECORDS * sizeof(HitGroupSbtRecord)));

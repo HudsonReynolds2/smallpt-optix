@@ -140,11 +140,9 @@ static __forceinline__ __device__ void trace(
 extern "C" __global__ void __raygen__rg() {
     const uint3 idx = optixGetLaunchIndex();
 
-    // Full-image pixel coordinates: tile launch index + tile origin.
     const unsigned int x = params.tile_origin_x + idx.x;
     const unsigned int y = params.tile_origin_y + idx.y;
 
-    // Seed: use full-image pixel coords so seeds are stable regardless of tiling.
     unsigned int seed = (y * params.width + x) * 1973u + params.subframe_index * 9277u;
     lcg(seed); // warm up
 
@@ -195,7 +193,7 @@ extern "C" __global__ void __raygen__rg() {
     L.y = fminf(fmaxf(L.y, 0.0f), 1.0f);
     L.z = fminf(fmaxf(L.z, 0.0f), 1.0f);
 
-    unsigned int pixel = (params.height - 1 - y) * params.width + x; // flip Y to match PPM convention
+    unsigned int pixel = (params.height - 1 - y) * params.width + x; // flip Y
     if (params.subframe_index == 0) {
         params.accum_buffer[pixel] = make_float4(L.x, L.y, L.z, 1.0f);
     } else {
@@ -221,46 +219,26 @@ extern "C" __global__ void __miss__ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Compute world-space surface normal at the current hit.
-// Branches on primitive type:
-//   - Built-in triangle: cross product of two edges (face normal); orient via
-//     optixIsFrontFaceHit so we always get the outward-facing side relative to
-//     the incoming ray direction. The Cornell walls don't have vertex normals,
-//     so flat shading is correct.
-//   - Built-in sphere:   (hit_pos - center).normalize(). Sphere center is read
-//     via optixGetSphereData (requires ALLOW_RANDOM_VERTEX_ACCESS on the GAS).
+// Compute surface normal. Walls use face normal; tessellated spheres use the
+// analytic normal (hit_pos - sphere_center) stored in HitGroupData for smooth
+// shading regardless of tessellation resolution.
 // ---------------------------------------------------------------------------
-static __forceinline__ __device__ float3 compute_normal(float3 hit_pos, float3 ray_dir) {
-    const OptixPrimitiveType pt = optixGetPrimitiveType();
-
-    if (pt == OPTIX_PRIMITIVE_TYPE_TRIANGLE) {
+static __forceinline__ __device__ float3 compute_normal(
+    float3 hit_pos, float3 ray_dir, const HitGroupData* data)
+{
+    float3 N;
+    if (data->is_sphere) {
+        N = normalize(hit_pos - data->sphere_center);
+    } else {
         const unsigned int prim_idx    = optixGetPrimitiveIndex();
         const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
         const OptixTraversableHandle gas = optixGetGASTraversableHandle();
-
         float3 verts[3];
         optixGetTriangleVertexData(gas, prim_idx, sbt_gas_idx, 0.0f, verts);
-
-        float3 e1 = verts[1] - verts[0];
-        float3 e2 = verts[2] - verts[0];
-        float3 N_obj = normalize(cross(e1, e2));
-        // Transform object-space normal to world space (handles any future IAS xform)
-        float3 N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
-        // Orient toward the incoming ray so back-face hits (secondary bounces
-        // grazing wall seams, or rays entering from outside the room) get the
-        // same outward-facing normal that the sphere path naturally returns.
-        return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
-    } else {
-        // OPTIX_PRIMITIVE_TYPE_SPHERE
-        const unsigned int prim_idx    = optixGetPrimitiveIndex();
-        const unsigned int sbt_gas_idx = optixGetSbtGASIndex();
-        const OptixTraversableHandle gas = optixGetGASTraversableHandle();
-        float4 q;
-        optixGetSphereData(gas, prim_idx, sbt_gas_idx, 0.0f, &q);
-
-        float3 center_ws = optixTransformPointFromObjectToWorldSpace(make_float3(q.x, q.y, q.z));
-        return normalize(hit_pos - center_ws);
+        float3 N_obj = normalize(cross(verts[1]-verts[0], verts[2]-verts[0]));
+        N = normalize(optixTransformNormalFromObjectToWorldSpace(N_obj));
     }
+    return dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x, -N.y, -N.z);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,25 +256,17 @@ extern "C" __global__ void __closesthit__ch() {
     const float3 ray_dir = optixGetWorldRayDirection();
     const float3 hit_pos = optixGetWorldRayOrigin() + t_hit * ray_dir;
 
-    float3 N = compute_normal(hit_pos, ray_dir);
+    float3 N = compute_normal(hit_pos, ray_dir, data);
 
-    // Accumulate emission
     prd->radiance += prd->throughput * data->emission;
 
-    // Russian roulette after depth 4: use throughput luminance BEFORE albedo multiply.
-    // Must use throughput (not albedo) so the light sphere (albedo=0) doesn't
-    // always terminate paths that just hit it.
+    // Russian roulette on throughput BEFORE albedo multiply.
     if (prd->depth > 4) {
-        float cont = fmaxf3(prd->throughput);
-        cont = fminf(cont, 1.0f);
-        if (rnd(prd->seed) >= cont) {
-            prd->done = 1;
-            return;
-        }
+        float cont = fminf(fmaxf3(prd->throughput), 1.0f);
+        if (rnd(prd->seed) >= cont) { prd->done = 1; return; }
         prd->throughput /= cont;
     }
 
-    // Multiply throughput by albedo after RR decision
     prd->throughput *= data->albedo;
 
     // Scatter
