@@ -34,7 +34,8 @@ param(
     [string]$AblationDepths = "2,4,6,8,12,20",
     [string]$AblationConfig = "1024x768_1024spp",
     [switch]$MemLog,
-    [switch]$NoMemLog
+    [switch]$NoMemLog,
+    [int]$TileSize = -1
 )
 
 $ErrorActionPreference = "Stop"
@@ -192,6 +193,7 @@ try { $gitHash = & git -C $ProjectRoot rev-parse --short HEAD 2>$null } catch {}
     "Config set:      $(if ($Ablation){'ablation'} elseif ($Mem){'mem'} elseif ($Full){'full'} else {'quick'})"
     "Configs:         $($Configs.Count)"
     "MaxDepth:        $(if ($MaxDepth -gt 0) { $MaxDepth } else { 'default (20)' })"
+    "TileSize:        $(if ($TileSize -ge 0) { $TileSize } else { 'default (compile-time TILE_W/TILE_H)' })"
     "MemLog:          forced=$($MemLog), suppressed=$($NoMemLog), nvsmi=$NvidiaSmiAvailable"
 ) | Out-File -FilePath $RunInfoPath -Encoding ascii
 
@@ -312,6 +314,9 @@ foreach ($cfg in $Configs) {
     )
     if ($cfgMaxDepth -gt 0) {
         $exeArgs += @("--max-depth", $cfgMaxDepth)
+    }
+    if ($TileSize -ge 0) {
+        $exeArgs += @("--tile-size", $TileSize)
     }
 
     @(

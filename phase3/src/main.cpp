@@ -131,8 +131,10 @@ static void write_ppm(const char* path, unsigned int w, unsigned int h, const fl
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [--width W] [--height H] [--spp N] [--max-depth D]\n"
-        "          [--output FILE] [--ptx FILE]\n"
-        "  Defaults: 1024x768, 256 spp, max-depth 20, output.ppm, shaders.ptx\n",
+        "          [--tile-size T] [--output FILE] [--ptx FILE]\n"
+        "  Defaults: 1024x768, 256 spp, max-depth 20, output.ppm, shaders.ptx\n"
+        "  --tile-size 0 means single full-image launch (phase 2 launch model).\n"
+        "  Otherwise tile is T x T. Default = compile-time TILE_W/TILE_H (512).\n",
         prog);
 }
 
@@ -166,6 +168,9 @@ int main(int argc, char* argv[]) {
     unsigned int height     = 768;
     unsigned int spp        = 256;
     unsigned int max_depth  = 20;
+    // -1 sentinel = "use compile-time TILE_W/TILE_H". 0 = single full-image
+    // launch (phase 2 model). Positive = explicit override (square tiles).
+    int          tile_size_cli = -1;
     const char*  outfile    = "output.ppm";
     std::string  ptx_path   = "shaders.ptx";
 
@@ -174,6 +179,7 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i],"--height")    && i+1<argc) height    = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--spp")       && i+1<argc) spp       = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--max-depth") && i+1<argc) max_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--tile-size") && i+1<argc) tile_size_cli = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--output")    && i+1<argc) outfile   = argv[++i];
         else if (!strcmp(argv[i],"--ptx")       && i+1<argc) ptx_path  = argv[++i];
         else if (!strcmp(argv[i],"--help"))     { usage(argv[0]); return 0; }
@@ -509,11 +515,27 @@ int main(int argc, char* argv[]) {
 
         // ---------------------------------------------------------------
         // Tile launch loop.
-        // Use TILE_W / TILE_H if both > 0; else single-launch mode for A/B.
+        // Resolve effective tile size:
+        //   --tile-size T (T > 0) : square TxT tiles, runtime override
+        //   --tile-size 0          : single full-image launch (phase 2 model)
+        //   --tile-size unset      : compile-time TILE_W / TILE_H (default 512)
+        // Tiles clamp to image extents in the inner loop, so non-multiples are fine.
         // Time the entire tile loop together (one cudaEvent pair).
         // ---------------------------------------------------------------
-        const unsigned int tile_w = (TILE_W > 0) ? (unsigned int)TILE_W : width;
-        const unsigned int tile_h = (TILE_H > 0) ? (unsigned int)TILE_H : height;
+        unsigned int tile_w, tile_h;
+        if (tile_size_cli < 0) {
+            // CLI not specified: use compile-time defaults.
+            tile_w = (TILE_W > 0) ? (unsigned int)TILE_W : width;
+            tile_h = (TILE_H > 0) ? (unsigned int)TILE_H : height;
+        } else if (tile_size_cli == 0) {
+            // Explicit "no tiling" -- single full-image launch.
+            tile_w = width;
+            tile_h = height;
+        } else {
+            // Explicit square TxT tile.
+            tile_w = (unsigned int)tile_size_cli;
+            tile_h = (unsigned int)tile_size_cli;
+        }
         const unsigned int n_tiles_x = (width  + tile_w - 1) / tile_w;
         const unsigned int n_tiles_y = (height + tile_h - 1) / tile_h;
 
@@ -611,6 +633,13 @@ int main(int argc, char* argv[]) {
         // Format: PHASE3_EXT,phase,res,spp,depth,time_ms,mrays,peak_mb
         printf("PHASE3_EXT: optix_phase3,%ux%u,%u,%u,%.2f,%.2f,%zu\n",
                width, height, spp, max_depth, loop_ms, mrays_sec, peak_used_mb);
+        // Tile-sweep row. Reports the effective tile dims and the tile
+        // count actually launched, so we can graph "no tiling" (tile=image)
+        // through "tiny tiles" on the same axes.
+        // Format: TILE_SWEEP,res,spp,tile_w,tile_h,n_tiles,time_ms,mrays,peak_mb
+        printf("TILE_SWEEP: %ux%u,%u,%u,%u,%u,%.2f,%.2f,%zu\n",
+               width, height, spp, tile_w, tile_h,
+               (n_tiles_x * n_tiles_y), loop_ms, mrays_sec, peak_used_mb);
 
         printf("Wrote: %s\n", outfile);
 

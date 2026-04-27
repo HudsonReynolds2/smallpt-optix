@@ -244,7 +244,7 @@ def chart_weak_scaling(p3: list[dict], out_path: Path) -> None:
     ax.plot(xs, ys, marker="o", linewidth=2, color="#2e8b57", markersize=10)
     ax.set_ylabel("Mrays / second")
     ax.set_xlabel("Resolution (pixels)")
-    ax.set_title(f"Phase 3 weak scaling at {best_spp} spp\n(throughput should be flat — pixels are embarrassingly parallel)")
+    ax.set_title(f"Phase 3 weak scaling at {best_spp} spp\n(throughput should be flat: pixels are parallel)")
     ax.grid(True, alpha=0.3)
 
     # Annotate each point
@@ -255,8 +255,10 @@ def chart_weak_scaling(p3: list[dict], out_path: Path) -> None:
     # Set y-axis to start a bit below min so the variation is visible but
     # the chart still tells the "flat" story.
     ymin, ymax = min(ys), max(ys)
+    #ymin, ymax = 0, 650
     span = ymax - ymin
-    ax.set_ylim(max(0, ymin - span * 0.5), ymax + span * 0.5 + 30)
+    #ax.set_ylim(max(0, ymin - span * 0.5), ymax + span * 0.5 + 30)
+    ax.set_ylim(0, 700)
 
     plt.xticks(rotation=15)
     plt.tight_layout()

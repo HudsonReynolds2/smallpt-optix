@@ -54,11 +54,11 @@ $RunInfoPath = Join-Path $RunDir   "run_info.txt"
 # All resolutions are integer multiples of 256x192 so primary-ray cost scales
 # cleanly: 4x, 16x, 64x... pixels. SPP doubles in steps for linear scaling.
 # -----------------------------------------------------------------------------
-$Configs = @(
+$Configs2 = @(
     @{ Name = "4096x3072_4096spp";  Width = 4096; Height = 3072; Spp = 4096  }
 )
 
-$Configs2 = @(
+$Configs = @(
     @{ Name = "512x384_256spp";    Width = 512;  Height = 384;  Spp = 256  },
     @{ Name = "512x384_1024spp";   Width = 512;  Height = 384;  Spp = 1024 },
     @{ Name = "1024x768_256spp";   Width = 1024; Height = 768;  Spp = 256  },
