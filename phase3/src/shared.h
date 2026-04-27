@@ -60,13 +60,39 @@ struct Params {
     OptixTraversableHandle handle;
 };
 
-// Per-ray payload - passed as pointer split across 2 uint32 registers
-struct PRD {
-    float3       radiance;
-    float3       throughput;
-    float3       origin;
-    float3       direction;
-    unsigned int seed;
-    int          depth;
-    int          done;
-};
+// ---------------------------------------------------------------------------
+// Per-ray payload (PRD)
+//
+// PHASE 3 v4: PRD is no longer a host-visible struct. The fields previously
+// stored in a stack-allocated PRD (which the compiler spilled to local memory
+// because we passed its address through the optixTrace call as a u64 pointer)
+// now live entirely in OptiX payload REGISTERS. This is a pure register-level
+// optimization -- no algorithmic change.
+//
+// Why: Nsight Compute on the previous build showed
+//   - DRAM 44.95% of peak (memory-bound)
+//   - Occupancy 31.23% (register-pressure limited)
+// The PRD pointer-through-payload pattern was forcing every prd-> field
+// access in CH/miss to round-trip through L1/L2 (and frequently DRAM, given
+// the L2 hit rate). Moving the fields to payload registers eliminates those
+// loads/stores entirely and frees the registers that had been holding the
+// PRD's stack slot, which raises occupancy.
+//
+// Payload register layout (15 total). The hot fields (radiance, throughput,
+// seed, depth, done) are in/out across the trace call; origin/direction are
+// outputs from CH that raygen reads to issue the next bounce.
+//
+//   0..2   radiance (float3) -- in: accumulator so far; out: same + emission
+//   3..5   throughput (float3) -- in: current; out: post-RR, post-albedo
+//   6      seed (uint32) -- in/out (RR + material sampling consume entropy)
+//   7      depth (uint32) -- in: bounce depth before hit; out: depth + 1
+//   8      done (uint32) -- in: 0; out: 1 if path terminated (miss or RR)
+//   9..11  next ray origin (float3) -- output only (CH writes hit_pos)
+//   12..14 next ray direction (float3) -- output only (CH writes scatter dir)
+//
+// Pipeline: numPayloadValues must be >= 15 in OptixPipelineCompileOptions.
+// On OptiX 8 the per-trace cap is 32, so 15 is comfortably within budget.
+//
+// Floats are passed via __float_as_uint / __uint_as_float for bitwise round
+// trips through the integer payload slots.
+// ---------------------------------------------------------------------------

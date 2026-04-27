@@ -157,10 +157,56 @@ $ActiveScene = if ($sceneNameLine) { $sceneNameLine.Matches[0].Groups[1].Value.T
 Write-Host "Active scene: $ActiveScene"
 
 if (-not $SkipPng) {
-    & cmd.exe /c "python -c `"from PIL import Image`" >NUL 2>NUL"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "WARN: python+PIL not found, using -SkipPng automatically" -ForegroundColor Yellow
+    # Find a working Python+Pillow combo for PNG conversion.
+    #
+    # Scoop installs Python into a VERSIONED subfolder, e.g.:
+    #   %USERPROFILE%\scoop\apps\python313\3.13.2\python.exe
+    # The \current\ junction that older Scoop versions created is often
+    # absent on fresh installs, so we glob for versioned subfolders instead.
+    $script:PyLauncher = $null
+
+    $pyCandidates = @()
+
+    # 1. Walk every python* app in Scoop and find python.exe in any subfolder
+    #    (covers both \current\ and versioned \X.Y.Z\ layouts).
+    $scoopApps = "$env:USERPROFILE\scoop\apps"
+    foreach ($appDir in @(Get-ChildItem -Path $scoopApps -Directory -Filter "python*" -ErrorAction SilentlyContinue)) {
+        foreach ($pyExe in @(Get-ChildItem -Path $appDir.FullName -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue)) {
+            if ($null -eq $pyExe) { continue }
+            # Skip the shim (it lives in \scoop\shims, not \scoop\apps)
+            $pyCandidates += "`"$($pyExe.FullName)`""
+        }
+    }
+
+    # 2. Windows py launcher in C:\Windows (rare in SSH sessions).
+    $py = "$env:WINDIR\py.exe"
+    if (Test-Path -LiteralPath $py) { $pyCandidates += "`"$py`" -3" }
+
+    # 3. Bare names as last resort (may hit the Microsoft Store stub).
+    $pyCandidates += "py -3"
+    $pyCandidates += "python3"
+    $pyCandidates += "python"
+
+    Write-Host "Probing Python launchers:"
+    foreach ($cand in $pyCandidates) {
+        & cmd.exe /c "$cand -c `"from PIL import Image`" > NUL 2> NUL"
+        $rc = $LASTEXITCODE
+        if ($rc -eq 0) {
+            Write-Host "  [OK]    $cand" -ForegroundColor Green
+            $script:PyLauncher = $cand
+            break
+        } else {
+            Write-Host "  [fail $rc] $cand" -ForegroundColor DarkGray
+        }
+    }
+
+    if ($null -eq $script:PyLauncher) {
+        Write-Host "WARN: no working python+Pillow found, using -SkipPng automatically" -ForegroundColor Yellow
+        Write-Host "      Your Python is at: $scoopApps\python313\<version>\python.exe" -ForegroundColor Yellow
+        Write-Host "      Install Pillow with: <python> -m pip install pillow" -ForegroundColor Yellow
         $SkipPng = $true
+    } else {
+        Write-Host "Python+PIL:     $script:PyLauncher" -ForegroundColor DarkGray
     }
 }
 
@@ -177,6 +223,21 @@ try {
 New-Item -ItemType Directory -Force -Path $RendersDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogsDir    | Out-Null
 New-Item -ItemType Directory -Force -Path $MemLogDir  | Out-Null
+
+# Emit the ppm->png helper script once. Per-image conversion just calls
+# `python helper.py <ppm> <png>`, which means paths with spaces, Unicode,
+# or apostrophes can't break us via quote-escaping (the previous version
+# embedded paths into a `python -c "..."` command line through cmd.exe and
+# was vulnerable to all of those). Argv-based is bulletproof.
+$PpmToPngScript = Join-Path $RunDir "ppm_to_png.py"
+if (-not $SkipPng) {
+    @"
+import sys
+from PIL import Image
+src, dst = sys.argv[1], sys.argv[2]
+Image.open(src).save(dst)
+"@ | Out-File -FilePath $PpmToPngScript -Encoding ascii
+}
 
 Copy-Item -Path $SceneHPath -Destination (Join-Path $RunDir "scene.h.snapshot") -Force
 
@@ -228,57 +289,80 @@ function Start-MemLogger {
     param([string]$ConfigName, [string]$LogDir)
     $logPath = Join-Path $LogDir "${ConfigName}_nvsmi.csv"
     $errPath = Join-Path $LogDir "${ConfigName}_nvsmi.err"
-    # Sample every 100ms. The correct nvidia-smi flag for sub-second polling
-    # is `-lms <ms>` (with a separate value argument). The previous v3 used
-    # `--loop-ms=100` which nvidia-smi rejects silently -- that's why the
-    # earlier run reported nvsmi=0 even though the logger appeared to run.
-    # Don't shadow the PowerShell automatic variable $args; use $nvsmiArgs.
     $nvsmiArgs = @(
         "--query-gpu=timestamp,memory.used,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
         "-lms", "100"
     )
-    $proc = Start-Process -FilePath "nvidia-smi" -ArgumentList $nvsmiArgs `
-        -NoNewWindow -PassThru `
-        -RedirectStandardOutput $logPath `
-        -RedirectStandardError  $errPath
-    Start-Sleep -Milliseconds 250  # let nvidia-smi spin up + emit first sample
-    return @{ Process = $proc; LogPath = $logPath; ErrPath = $errPath }
+
+    try {
+        $proc = Start-Process -FilePath "nvidia-smi" -ArgumentList $nvsmiArgs `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $logPath `
+            -RedirectStandardError  $errPath `
+            -ErrorAction Stop
+
+        if ($null -eq $proc) {
+            Write-Host "  nvsmi memlog launch returned no process" -ForegroundColor Yellow
+            return $null
+        }
+
+        Start-Sleep -Milliseconds 250
+
+        try {
+            if ($proc.HasExited -and $proc.ExitCode -ne 0) {
+                Write-Host "  nvsmi memlog exited immediately (code $($proc.ExitCode))" -ForegroundColor Yellow
+                return $null
+            }
+        } catch {
+            Write-Host "  nvsmi memlog status check failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            return $null
+        }
+
+        return @{ Process = $proc; LogPath = $logPath; ErrPath = $errPath }
+    } catch {
+        Write-Host "  nvsmi memlog launch failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
 }
 
 function Stop-MemLogger {
     param($Logger)
     if ($null -eq $Logger) { return 0 }
+    if ($null -eq $Logger.Process) { return 0 }
     try {
-        if (-not $Logger.Process.HasExited) {
-            Stop-Process -Id $Logger.Process.Id -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-    # If nvidia-smi rejected the flags, it'll have written to stderr and the
-    # CSV will be empty. Surface that explicitly.
-    if (Test-Path $Logger.ErrPath) {
-        $errText = (Get-Content $Logger.ErrPath -Raw).Trim()
-        if ($errText -ne "") {
-            Write-Host "  nvsmi stderr:" -ForegroundColor Yellow
-            $errText -split "`n" | Select-Object -First 5 | ForEach-Object {
-                Write-Host "    $_" -ForegroundColor Yellow
+        try {
+            if (-not $Logger.Process.HasExited) {
+                Stop-Process -Id $Logger.Process.Id -Force -ErrorAction SilentlyContinue
             }
-        }
-    }
-    if (Test-Path $Logger.LogPath) {
-        $maxMb = 0
-        Get-Content $Logger.LogPath | ForEach-Object {
-            $cols = $_ -split ',' | ForEach-Object { $_.Trim() }
-            if ($cols.Count -ge 2) {
-                $mb = 0
-                if ([int]::TryParse($cols[1], [ref]$mb)) {
-                    if ($mb -gt $maxMb) { $maxMb = $mb }
+        } catch {}
+        if (Test-Path $Logger.ErrPath) {
+            $errText = (Get-Content $Logger.ErrPath -Raw).Trim()
+            if ($errText -ne "") {
+                Write-Host "  nvsmi stderr:" -ForegroundColor Yellow
+                $errText -split "`n" | Select-Object -First 5 | ForEach-Object {
+                    Write-Host "    $_" -ForegroundColor Yellow
                 }
             }
         }
-        return $maxMb
+        if (Test-Path $Logger.LogPath) {
+            $maxMb = 0
+            Get-Content $Logger.LogPath | ForEach-Object {
+                $cols = $_ -split ',' | ForEach-Object { $_.Trim() }
+                if ($cols.Count -ge 2) {
+                    $mb = 0
+                    if ([int]::TryParse($cols[1], [ref]$mb)) {
+                        if ($mb -gt $maxMb) { $maxMb = $mb }
+                    }
+                }
+            }
+            return $maxMb
+        }
+        return 0
+    } catch {
+        Write-Host "  nvsmi memlog teardown failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        return 0
     }
-    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -415,11 +499,6 @@ foreach ($cfg in $Configs) {
         }
     }
 
-    # If we have both an exe-internal peak and an nvsmi peak, take the max.
-    # nvsmi sees the full process VRAM (including driver overhead the exe
-    # doesn't see), so its number is usually a few hundred MB higher and
-    # is the right one for the slide. Internal peak is ground truth for
-    # what *our code* allocated.
     $reportedPeak = [Math]::Max($extPeakMb, $nvsmiPeakMb)
     if ($reportedPeak -gt 0) {
         Write-Host ("  Peak: {0} MB (exe={1}, nvsmi={2})" -f $reportedPeak, $extPeakMb, $nvsmiPeakMb) -ForegroundColor DarkGray
@@ -427,14 +506,20 @@ foreach ($cfg in $Configs) {
 
     if (-not $SkipPng) {
         if (Test-Path $ppmPath) {
-            $pyCmd = "from PIL import Image; Image.open(r'$ppmPath').save(r'$pngPath')"
-            $pyCmdEscaped = $pyCmd.Replace('"', '\"')
-            & cmd.exe /c "python -c `"$pyCmdEscaped`" >NUL 2>NUL"
-            if ($LASTEXITCODE -eq 0) {
+            $line  = "$($script:PyLauncher) `"$PpmToPngScript`" `"$ppmPath`" `"$pngPath`""
+            $pyOut = & cmd.exe /c "$line 2>&1"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $pngPath)) {
                 Write-Host "  PNG: $pngPath" -ForegroundColor Green
             } else {
-                Write-Host "  PNG conversion failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
-                $failures += @{ Config = $name; Reason = "PNG conversion exit $LASTEXITCODE" }
+                $reason = if ($LASTEXITCODE -ne 0) { "exit $LASTEXITCODE" } else { "exit 0 but file not on disk" }
+                Write-Host "  PNG conversion failed ($reason)" -ForegroundColor Yellow
+                Write-Host "    cmdline: $line" -ForegroundColor Yellow
+                if ($pyOut) {
+                    $pyOut | Select-Object -First 5 | ForEach-Object {
+                        Write-Host "    $_" -ForegroundColor Yellow
+                    }
+                }
+                $failures += @{ Config = $name; Reason = "PNG conversion: $reason" }
             }
         } else {
             Write-Host "  WARN: PPM not produced at $ppmPath" -ForegroundColor Yellow

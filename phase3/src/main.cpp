@@ -353,7 +353,7 @@ int main(int argc, char* argv[]) {
             pipelineCompileOptions.usesMotionBlur        = false;
             // PHASE 3: single GAS, no IAS.
             pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-            pipelineCompileOptions.numPayloadValues      = 2;
+            pipelineCompileOptions.numPayloadValues      = 15;  // PHASE 3 v4: PRD lives in payload registers (was 2 = ptr-split)
             pipelineCompileOptions.numAttributeValues    = 2;
             pipelineCompileOptions.exceptionFlags        = OPTIX_EXCEPTION_FLAG_NONE;
             pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";

@@ -29,18 +29,53 @@ __device__ __forceinline__ float fmaxf3(float3 v) { return fmaxf(v.x, fmaxf(v.y,
 extern "C" { __constant__ Params params; }
 
 // ---------------------------------------------------------------------------
-// Payload pointer packing (PRD passed as pointer split into 2 x uint32)
+// Payload register accessors (PHASE 3 v4: registers, not pointer-to-stack).
+//
+// We use 15 payload registers; layout documented in shared.h. Read paths use
+// optixGetPayload_N() and write paths use optixSetPayload_N(). Floats are
+// bit-cast through uint32 via __float_as_uint / __uint_as_float, which the
+// compiler turns into zero-cost moves on Ampere.
+//
+// These helpers exist to keep CH and miss readable; everything inlines.
 // ---------------------------------------------------------------------------
-static __forceinline__ __device__ unsigned int u32_from_ptr_lo(PRD* ptr) {
-    return static_cast<unsigned int>(reinterpret_cast<unsigned long long>(ptr));
+
+// --- Reads (used in CH and miss) ---
+static __forceinline__ __device__ float3 prd_get_radiance() {
+    return make_float3(__uint_as_float(optixGetPayload_0()),
+                       __uint_as_float(optixGetPayload_1()),
+                       __uint_as_float(optixGetPayload_2()));
 }
-static __forceinline__ __device__ unsigned int u32_from_ptr_hi(PRD* ptr) {
-    return static_cast<unsigned int>(reinterpret_cast<unsigned long long>(ptr) >> 32);
+static __forceinline__ __device__ float3 prd_get_throughput() {
+    return make_float3(__uint_as_float(optixGetPayload_3()),
+                       __uint_as_float(optixGetPayload_4()),
+                       __uint_as_float(optixGetPayload_5()));
 }
-static __forceinline__ __device__ PRD* ptr_from_u32(unsigned int lo, unsigned int hi) {
-    return reinterpret_cast<PRD*>(
-        static_cast<unsigned long long>(lo) | (static_cast<unsigned long long>(hi) << 32)
-    );
+static __forceinline__ __device__ unsigned int prd_get_seed()  { return optixGetPayload_6(); }
+static __forceinline__ __device__ unsigned int prd_get_depth() { return optixGetPayload_7(); }
+
+// --- Writes (used in CH and miss) ---
+static __forceinline__ __device__ void prd_set_radiance(float3 r) {
+    optixSetPayload_0(__float_as_uint(r.x));
+    optixSetPayload_1(__float_as_uint(r.y));
+    optixSetPayload_2(__float_as_uint(r.z));
+}
+static __forceinline__ __device__ void prd_set_throughput(float3 t) {
+    optixSetPayload_3(__float_as_uint(t.x));
+    optixSetPayload_4(__float_as_uint(t.y));
+    optixSetPayload_5(__float_as_uint(t.z));
+}
+static __forceinline__ __device__ void prd_set_seed (unsigned int s) { optixSetPayload_6(s); }
+static __forceinline__ __device__ void prd_set_depth(unsigned int d) { optixSetPayload_7(d); }
+static __forceinline__ __device__ void prd_set_done (unsigned int d) { optixSetPayload_8(d); }
+static __forceinline__ __device__ void prd_set_origin(float3 o) {
+    optixSetPayload_9 (__float_as_uint(o.x));
+    optixSetPayload_10(__float_as_uint(o.y));
+    optixSetPayload_11(__float_as_uint(o.z));
+}
+static __forceinline__ __device__ void prd_set_direction(float3 d) {
+    optixSetPayload_12(__float_as_uint(d.x));
+    optixSetPayload_13(__float_as_uint(d.y));
+    optixSetPayload_14(__float_as_uint(d.z));
 }
 
 // ---------------------------------------------------------------------------
@@ -112,23 +147,63 @@ static __forceinline__ __device__ float3 refract_or_reflect(
 }
 
 // ---------------------------------------------------------------------------
-// optixTrace wrapper
+// optixTrace wrapper (PHASE 3 v4)
+//
+// Takes the in/out payload state by reference and updates it in place from
+// the 15 payload registers after the trace returns. Inputs that don't need
+// to round-trip (origin/direction are output-only here -- the *current* ray's
+// origin/direction go in as the trace arguments, not as payload) are written
+// out by CH and read back by the caller via the `next_*` out-params.
+//
+// The float<->uint reinterpret pattern is a no-op on the GPU (mov, free).
 // ---------------------------------------------------------------------------
 static __forceinline__ __device__ void trace(
     OptixTraversableHandle handle,
     float3 origin, float3 direction,
     float tmin, float tmax,
-    PRD* prd)
+    // in/out payload state
+    float3& radiance,
+    float3& throughput,
+    unsigned int& seed,
+    unsigned int& depth,
+    unsigned int& done,
+    // out-only payload state (written by CH, read by caller)
+    float3& next_origin,
+    float3& next_direction)
 {
-    unsigned int lo = u32_from_ptr_lo(prd);
-    unsigned int hi = u32_from_ptr_hi(prd);
+    // Pack inputs into payload registers (bit-cast floats through uint32).
+    unsigned int p0  = __float_as_uint(radiance.x);
+    unsigned int p1  = __float_as_uint(radiance.y);
+    unsigned int p2  = __float_as_uint(radiance.z);
+    unsigned int p3  = __float_as_uint(throughput.x);
+    unsigned int p4  = __float_as_uint(throughput.y);
+    unsigned int p5  = __float_as_uint(throughput.z);
+    unsigned int p6  = seed;
+    unsigned int p7  = depth;
+    unsigned int p8  = done;
+    // p9..p14 are output-only; CH will overwrite them. Pre-zero so the
+    // compiler doesn't have to track uninitialized reads if optixTrace's
+    // ABI cares (it doesn't on current OptiX, but cheap insurance).
+    unsigned int p9  = 0u, p10 = 0u, p11 = 0u;
+    unsigned int p12 = 0u, p13 = 0u, p14 = 0u;
+
     optixTrace(
         handle, origin, direction, tmin, tmax,
         0.0f,                      // ray time
         OptixVisibilityMask(1),
         OPTIX_RAY_FLAG_NONE,
         0, 1, 0,                   // SBT offset, stride, miss index
-        lo, hi);
+        p0, p1, p2, p3, p4, p5, p6, p7,
+        p8, p9, p10, p11, p12, p13, p14);
+
+    // Unpack outputs.
+    radiance       = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+    throughput     = make_float3(__uint_as_float(p3), __uint_as_float(p4), __uint_as_float(p5));
+    seed           = p6;
+    depth          = p7;
+    done           = p8;
+    next_origin    = make_float3(__uint_as_float(p9),  __uint_as_float(p10), __uint_as_float(p11));
+    next_direction = make_float3(__uint_as_float(p12), __uint_as_float(p13), __uint_as_float(p14));
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +226,13 @@ extern "C" __global__ void __raygen__rg() {
     const unsigned int spp        = params.samples_per_launch;
     const unsigned int max_bounce = params.max_bounces;
 
+    // PHASE 3 v4: gaze is loop-invariant across the spp loop. Hoist out of
+    // the per-sample body so it isn't recomputed (and renormalized) for every
+    // sample. Tiny win in absolute terms but free; it's also the kind of
+    // loop-invariant code motion that EC527 hammered on.
+    const float3 gaze_raw = make_float3(0.0f, -0.042612f, -1.0f);
+    const float3 gaze     = gaze_raw / sqrtf(dot(gaze_raw, gaze_raw));
+
     for (unsigned int s = 0; s < spp; ++s) {
         // Tent filter (matching Phase 1 exactly)
         float u1 = 2.0f * rnd(seed);
@@ -162,35 +244,39 @@ extern "C" __global__ void __raygen__rg() {
         float fx = ((float)x + 0.5f + dx) / (float)params.width  - 0.5f;
         float fy = ((float)y + 0.5f + dy) / (float)params.height - 0.5f;
 
-        float3 d = params.cx * fx + params.cy * fy;
-        float3 gaze = make_float3(0.0f, -0.042612f, -1.0f);
-        float gnorm = sqrtf(dot(gaze,gaze));
-        gaze = gaze / gnorm;
-        d = d + gaze;
+        float3 d = params.cx * fx + params.cy * fy + gaze;
 
         // origin = eye + d * 130.0f advances the ray to the image plane
-        // (smallpt convention; smallpt uses the same 130.0 offset). Earlier
-        // experiments with `gaze` in place of `d` produced an over-zoomed
-        // view; smaller offsets re-introduced an aperture-edge ghost ring.
+        // (smallpt convention). See Phase 2 history for the aperture-edge
+        // ghost-ring experiment that pinned this constant.
         float3 ray_origin    = params.eye + d * 130.0f;
         float3 ray_direction = normalize(d);
 
-        // Path trace
-        PRD prd;
-        prd.radiance   = make_float3(0.0f, 0.0f, 0.0f);
-        prd.throughput = make_float3(1.0f, 1.0f, 1.0f);
-        prd.origin     = ray_origin;
-        prd.direction  = ray_direction;
-        prd.seed       = seed;
-        prd.depth      = 0;
-        prd.done       = 0;
+        // ---- Path-trace state (lives in raygen registers, NOT a stack PRD).
+        // These are passed to trace() by reference and updated in place from
+        // the OptiX payload registers. No memory traffic to/from local mem.
+        float3       prd_radiance   = make_float3(0.0f, 0.0f, 0.0f);
+        float3       prd_throughput = make_float3(1.0f, 1.0f, 1.0f);
+        unsigned int prd_seed       = seed;
+        unsigned int prd_depth      = 0;
+        unsigned int prd_done       = 0;
 
-        for (unsigned int bounce = 0; bounce < max_bounce && !prd.done; ++bounce) {
-            trace(params.handle, prd.origin, prd.direction, 1e-4f, 1e16f, &prd);
+        // Per-bounce: out-params from CH carry the next ray's origin/dir.
+        float3 next_origin, next_direction;
+
+        for (unsigned int bounce = 0; bounce < max_bounce && !prd_done; ++bounce) {
+            trace(params.handle, ray_origin, ray_direction, 1e-4f, 1e16f,
+                  prd_radiance, prd_throughput, prd_seed, prd_depth, prd_done,
+                  next_origin, next_direction);
+
+            // Hand the new ray off to the next iteration. (If prd_done is set
+            // by miss or RR, the loop exits before these are used.)
+            ray_origin    = next_origin;
+            ray_direction = next_direction;
         }
 
-        seed = prd.seed;
-        L += prd.radiance * (1.0f / spp);
+        seed = prd_seed;
+        L += prd_radiance * (1.0f / spp);
     }
 
     // Clamp and accumulate
@@ -214,13 +300,11 @@ extern "C" __global__ void __raygen__rg() {
 }
 
 // ---------------------------------------------------------------------------
-// Miss shader - background is black (no environment light in Cornell box)
+// Miss shader - background is black (no environment light in Cornell box).
+// Only thing we need to communicate to raygen is "this path terminated".
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __miss__ms() {
-    unsigned int lo = optixGetPayload_0();
-    unsigned int hi = optixGetPayload_1();
-    PRD* prd = ptr_from_u32(lo, hi);
-    prd->done = 1;
+    prd_set_done(1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,30 +348,45 @@ static __forceinline__ __device__ float3 compute_normal(
 // ---------------------------------------------------------------------------
 // Closest-hit shader (shared by all geometry).
 // Evaluates material, accumulates emission, computes scatter direction.
+//
+// PHASE 3 v4: payload is in registers (see shared.h for layout). All
+// "prd->foo" reads/writes are now optixGetPayload_N / optixSetPayload_N.
+// Locally we still keep mutable copies of the hot fields (radiance,
+// throughput, seed, depth) so the per-hit math reads like normal scalar
+// code; we set the payload registers once at the bottom.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __closesthit__ch() {
-    unsigned int lo = optixGetPayload_0();
-    unsigned int hi = optixGetPayload_1();
-    PRD* prd = ptr_from_u32(lo, hi);
-
     const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
 
     const float  t_hit   = optixGetRayTmax();
     const float3 ray_dir = optixGetWorldRayDirection();
     const float3 hit_pos = optixGetWorldRayOrigin() + t_hit * ray_dir;
 
-    float3 N = compute_normal(hit_pos, ray_dir, data);
+    const float3 N = compute_normal(hit_pos, ray_dir, data);
 
-    prd->radiance += prd->throughput * data->emission;
+    // Pull the in-payload state into locals.
+    float3       radiance   = prd_get_radiance();
+    float3       throughput = prd_get_throughput();
+    unsigned int seed       = prd_get_seed();
+    unsigned int depth      = prd_get_depth();
+
+    radiance += throughput * data->emission;
 
     // Russian roulette on throughput BEFORE albedo multiply.
-    if (prd->depth > 4) {
-        float cont = fminf(fmaxf3(prd->throughput), 1.0f);
-        if (rnd(prd->seed) >= cont) { prd->done = 1; return; }
-        prd->throughput /= cont;
+    // (Matches v3 semantics exactly; also early-out path -- only need to
+    // commit radiance and the done flag in that branch.)
+    if (depth > 4) {
+        float cont = fminf(fmaxf3(throughput), 1.0f);
+        if (rnd(seed) >= cont) {
+            prd_set_radiance(radiance);
+            prd_set_seed(seed);
+            prd_set_done(1u);
+            return;
+        }
+        throughput /= cont;
     }
 
-    prd->throughput *= data->albedo;
+    throughput *= data->albedo;
 
     // Scatter
     float3 new_dir;
@@ -304,8 +403,8 @@ extern "C" __global__ void __closesthit__ch() {
 
     case MAT_REFRACTIVE: {
         float pr;
-        new_dir = refract_or_reflect(ray_dir, N, 1.0f, 1.5f, pr, prd->seed);
-        prd->throughput *= pr;
+        new_dir = refract_or_reflect(ray_dir, N, 1.0f, 1.5f, pr, seed);
+        throughput *= pr;
         break;
     }
 
@@ -314,13 +413,20 @@ extern "C" __global__ void __closesthit__ch() {
         float3 w = dot(N, ray_dir) < 0.0f ? N : make_float3(-N.x,-N.y,-N.z);
         float3 u, v;
         onb_from_normal(w, u, v);
-        float3 sample = cosine_sample_hemisphere(rnd(prd->seed), rnd(prd->seed));
+        float3 sample = cosine_sample_hemisphere(rnd(seed), rnd(seed));
         new_dir = normalize(sample.x * u + sample.y * v + sample.z * w);
         break;
     }
     }
 
-    prd->origin    = hit_pos;
-    prd->direction = new_dir;
-    prd->depth++;
+    // Commit all updated payload state in one block at the end.
+    // The compiler will batch these into a contiguous set of payload-register
+    // moves with no spills if register pressure cooperates.
+    prd_set_radiance(radiance);
+    prd_set_throughput(throughput);
+    prd_set_seed(seed);
+    prd_set_depth(depth + 1u);
+    prd_set_done(0u);
+    prd_set_origin(hit_pos);
+    prd_set_direction(new_dir);
 }
