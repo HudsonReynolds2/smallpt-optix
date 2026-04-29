@@ -30,21 +30,21 @@ namespace smallpt {
 	// Constants
 	//-------------------------------------------------------------------------
 
-	constexpr double g_pi = 3.14159265358979323846;
+	constexpr float g_pi = 3.14159265358979323846f;
 
 	//-------------------------------------------------------------------------
 	// Utilities
 	//-------------------------------------------------------------------------
 
-	__host__ __device__ inline double Clamp(double v, 
-											double low = 0.0, 
-											double high = 1.0) noexcept {
+	__host__ __device__ inline float Clamp(float v,
+	                                       float low  = 0.0f,
+	                                       float high = 1.0f) noexcept {
 
-		return fmin(fmax(v, low), high);
+		return fminf(fmaxf(v, low), high);
 	}
 
-	inline std::uint8_t ToByte(double color, double gamma = 2.2) noexcept {
-		const double gcolor = std::pow(color, 1.0 / gamma);
-		return static_cast< std::uint8_t >(Clamp(255.0 * gcolor, 0.0, 255.0));
+	inline std::uint8_t ToByte(float color, float gamma = 2.2f) noexcept {
+		const float gcolor = std::pow(color, 1.0f / gamma);
+		return static_cast< std::uint8_t >(Clamp(255.0f * gcolor, 0.0f, 255.0f));
 	}
 }

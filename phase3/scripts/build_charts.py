@@ -7,6 +7,11 @@ and emits PNG chart files for the EC527 deck.
 
 Inputs (all paths configurable via CLI):
 
+  --phase0-csv  : optional, phase 0 CPU thread-scaling timings.csv.
+                  Schema: phase,scene,resolution,spp,time_ms,mrays_sec,notes,run_timestamp
+                  scene encodes thread count as phase0_cpu_Nt.
+                  Produces thread_scaling.png and adds a CPU peak bar to mrays_bar.
+
   --phase1-csv  : optional, single-row CSV with phase 1 cu-smallpt timings.
                   Schema:  phase,scene,resolution,spp,time_ms,mrays_sec,notes,run_timestamp
                   If absent or the file doesn't exist, the bar chart still
@@ -26,15 +31,13 @@ Inputs (all paths configurable via CLI):
 
 Outputs (under --out-dir):
 
-  mrays_bar.png            : phase1 / phase2 / phase3 bar chart at the
-                              "headline" config (1024x768_256spp).
+  thread_scaling.png       : phase 0 Mrays/s and speedup vs thread count.
+  mrays_bar.png            : phase0 (peak) / phase1 / phase2 / phase3 bar
+                              chart at the "headline" config (1024x768_256spp).
   weak_scaling.png         : phase 3 Mrays/s vs resolution at fixed spp.
-  bounce_depth.png         : phase 3 Mrays/s and (if --reference-png is
-                              given) SSIM vs --max-depth.
+  bounce_depth.png         : phase 3 Mrays/s and time vs --max-depth.
   memory_4k.png            : peak GPU memory used by phase 3 at the 4K
-                              configs in timings_ext.csv. Compared against
-                              the documented 18 GB phase 2 number (drawn
-                              as a horizontal reference line).
+                              configs in timings_ext.csv.
 
 If matplotlib isn't installed we fail loudly with a pip install hint.
 """
@@ -43,7 +46,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import os
 import sys
 from pathlib import Path
@@ -64,19 +66,14 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# CSV readers (stdlib only; no pandas dependency to keep this portable
-# across Hudson's Windows + WSL setups).
+# CSV readers
 # ---------------------------------------------------------------------------
 
 def read_timings(path: Optional[Path]) -> list[dict]:
-    """Read a timings.csv. Schema is enforced by the benchmark scripts.
+    """Read a timings.csv.
 
     Returns rows as dicts with keys:
         phase, scene, resolution, spp, time_ms, mrays_sec, notes, run_timestamp
-
-    If path is None or file doesn't exist, returns []. Caller decides what
-    to do about a missing file -- we don't die because phase 1 may not be
-    rerun yet on Hudson's machine.
     """
     if path is None or not path.exists():
         return []
@@ -84,7 +81,6 @@ def read_timings(path: Optional[Path]) -> list[dict]:
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Coerce numeric fields. Tolerate missing/blank values.
             try:
                 row["spp"]       = int(row["spp"])
                 row["time_ms"]   = float(row["time_ms"])
@@ -92,6 +88,53 @@ def read_timings(path: Optional[Path]) -> list[dict]:
             except (KeyError, ValueError):
                 continue
             rows.append(row)
+    return rows
+
+
+def read_phase0_timings(path: Optional[Path]) -> list[dict]:
+    """Read phase0 CPU thread-scaling timings.csv.
+
+    Parses thread count from the scene field (e.g. 'phase0_cpu_24t' -> 24).
+    Also extracts min_s and speedup from the notes field where present.
+    """
+    if path is None or not path.exists():
+        return []
+    rows = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                row["spp"]       = int(row["spp"])
+                row["time_ms"]   = float(row["time_ms"])
+                row["mrays_sec"] = float(row["mrays_sec"])
+            except (KeyError, ValueError):
+                continue
+
+            # Parse thread count from scene name: phase0_cpu_Nt
+            scene = row.get("scene", "")
+            threads = None
+            if scene.startswith("phase0_cpu_") and scene.endswith("t"):
+                try:
+                    threads = int(scene[len("phase0_cpu_"):-1])
+                except ValueError:
+                    pass
+            if threads is None:
+                continue
+            row["threads"] = threads
+
+            # Parse min_s from notes field (e.g. "threads=1;runs=3;min_s=71.779;...")
+            min_s = None
+            for part in row.get("notes", "").split(";"):
+                if part.startswith("min_s="):
+                    try:
+                        min_s = float(part[6:])
+                    except ValueError:
+                        pass
+            row["min_s"] = min_s
+
+            rows.append(row)
+
+    rows.sort(key=lambda r: r["threads"])
     return rows
 
 
@@ -140,7 +183,6 @@ def find_row(rows: list[dict], resolution: str, spp: int) -> Optional[dict]:
     matches = [r for r in rows if r.get("resolution") == resolution and r.get("spp") == spp]
     if not matches:
         return None
-    # Most recent wins (lexicographic timestamp comparison works for our format).
     return max(matches, key=lambda r: r.get("run_timestamp", ""))
 
 
@@ -148,19 +190,88 @@ def find_row(rows: list[dict], resolution: str, spp: int) -> Optional[dict]:
 # Charts
 # ---------------------------------------------------------------------------
 
+def chart_thread_scaling(p0: list[dict], out_path: Path) -> None:
+    """Thread scaling chart: Mrays/s and speedup vs thread count (phase 0 CPU)."""
+    if not p0:
+        print("WARN: no phase 0 data; skipping thread_scaling", file=sys.stderr)
+        return
+
+    threads  = [r["threads"]   for r in p0]
+    mrays    = [r["mrays_sec"] for r in p0]
+    baseline = mrays[0] if mrays[0] > 0 else 1.0
+    speedups = [m / baseline for m in mrays]
+    ideal    = [t / threads[0] for t in threads]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # --- Left: Mrays/s vs threads ---
+    ax1.plot(threads, mrays, marker="o", linewidth=2, color="#2e8b57", markersize=10,
+             label="Measured")
+    ax1.set_xlabel("Threads")
+    ax1.set_ylabel("Mrays / second")
+    ax1.set_title("Throughput vs thread count")
+    ax1.set_xticks(threads)
+    ax1.grid(True, alpha=0.3)
+    for t, m in zip(threads, mrays):
+        ax1.annotate(f"{m:.2f}", (t, m), textcoords="offset points",
+                     xytext=(0, 9), ha="center", fontsize=9)
+
+    # --- Right: Speedup vs threads ---
+    ax2.plot(threads, speedups, marker="o", linewidth=2, color="#2e8b57", markersize=10,
+             label="Measured speedup")
+    ax2.plot(threads, ideal, linestyle="--", linewidth=1.5, color="#888888",
+             label="Ideal linear")
+    ax2.set_xlabel("Threads")
+    ax2.set_ylabel("Speedup (vs 1 thread)")
+    ax2.set_title("Speedup vs thread count")
+    ax2.set_xticks(threads)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    for t, s in zip(threads, speedups):
+        ax2.annotate(f"{s:.2f}x", (t, s), textcoords="offset points",
+                     xytext=(0, 9), ha="center", fontsize=9)
+
+    res = p0[0].get("resolution", "?")
+    spp = p0[0].get("spp", "?")
+    fig.suptitle(
+        f"Phase 0 — CPU smallpt thread scaling @ {res}, {spp} spp\n"
+        f"Peak: {mrays[-1]:.2f} Mrays/s at {threads[-1]} threads ({speedups[-1]:.2f}x speedup)",
+        fontsize=12,
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
+
+
 def chart_mrays_bar(
+    p0: list[dict],
     p1: list[dict], p2: list[dict], p3: list[dict],
     headline_res: str, headline_spp: int,
     out_path: Path,
 ) -> None:
-    """Bar chart: phase 1 / phase 2 / phase 3 Mrays/s at the headline config."""
+    """Bar chart: phase 0 (CPU peak) / phase 1 / phase 2 / phase 3 Mrays/s."""
     labels  = []
     values  = []
     colors  = []
 
+    # Phase 0: use the peak (max thread) row that matches the headline resolution.
+    # spp may differ (phase0 used 100 spp) so we match on resolution only and
+    # pick the highest-thread row.
+    if p0:
+        p0_res = [r for r in p0 if r.get("resolution") == headline_res]
+        if not p0_res:
+            # Fall back to any resolution — pick peak thread row
+            p0_res = p0
+        p0_peak = max(p0_res, key=lambda r: r["threads"])
+        labels.append(f"Phase 0\nCPU ({p0_peak['threads']}t)\n{p0_peak['spp']} spp")
+        values.append(p0_peak["mrays_sec"])
+        colors.append("#c0a060")
+
     r1 = find_row(p1, headline_res, headline_spp)
     if r1:
-        labels.append("Phase 1\ncu-smallpt")
+        labels.append("Phase 1\ncu-smallpt\n(GPU)")
         values.append(r1["mrays_sec"])
         colors.append("#888888")
 
@@ -180,10 +291,10 @@ def chart_mrays_bar(
         print(f"WARN: no data for headline config {headline_res}_{headline_spp}spp; skipping mrays_bar", file=sys.stderr)
         return
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(max(7, len(values) * 2), 5))
     bars = ax.bar(labels, values, color=colors, edgecolor="black", linewidth=0.7)
     ax.set_ylabel("Mrays / second")
-    ax.set_title(f"Throughput at {headline_res}, {headline_spp} spp\nRTX 3080 Ti (SM 8.6)")
+    ax.set_title(f"Throughput comparison — RTX 3080 Ti (SM 8.6) vs CPU\n{headline_res}")
     ax.grid(axis="y", alpha=0.3)
 
     # Annotate each bar with its value
@@ -191,8 +302,8 @@ def chart_mrays_bar(
         ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.0f}",
                 ha="center", va="bottom", fontsize=11, fontweight="bold")
 
-    # Annotate speedups vs phase 1 if available
-    if r1 and len(values) >= 2:
+    # Annotate speedups vs first bar
+    if len(values) >= 2:
         baseline = values[0]
         for i, b in enumerate(bars[1:], start=1):
             speedup = values[i] / baseline if baseline > 0 else 0
@@ -208,29 +319,24 @@ def chart_mrays_bar(
 
 
 def chart_weak_scaling(p3: list[dict], out_path: Path) -> None:
-    """Mrays/s vs resolution at constant spp.
-
-    Picks the spp value that has the most resolution data points. Plots a
-    flat-ish curve to demonstrate throughput stability.
-    """
+    """Mrays/s vs resolution at constant spp (phase 3)."""
     if not p3:
         print("WARN: no phase 3 data; skipping weak_scaling", file=sys.stderr)
         return
 
-    # Bucket by spp, find the one with most distinct resolutions
     by_spp: dict[int, list[dict]] = {}
     for r in p3:
         by_spp.setdefault(r["spp"], []).append(r)
     best_spp = max(by_spp.keys(), key=lambda s: len({r["resolution"] for r in by_spp[s]}))
     rows = by_spp[best_spp]
 
-    # Sort by pixel count
     def pix_count(res: str) -> int:
         try:
             w, h = res.split("x")
             return int(w) * int(h)
         except (ValueError, AttributeError):
             return 0
+
     rows = sorted(rows, key=lambda r: pix_count(r["resolution"]))
 
     if not rows:
@@ -247,17 +353,11 @@ def chart_weak_scaling(p3: list[dict], out_path: Path) -> None:
     ax.set_title(f"Phase 3 weak scaling at {best_spp} spp\n(throughput should be flat: pixels are parallel)")
     ax.grid(True, alpha=0.3)
 
-    # Annotate each point
     for x, y in zip(xs, ys):
         ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points",
                     xytext=(0, 10), ha="center", fontsize=10)
 
-    # Set y-axis to start a bit below min so the variation is visible but
-    # the chart still tells the "flat" story.
     ymin, ymax = min(ys), max(ys)
-    #ymin, ymax = 0, 650
-    span = ymax - ymin
-    #ax.set_ylim(max(0, ymin - span * 0.5), ymax + span * 0.5 + 30)
     ax.set_ylim(0, 700)
 
     plt.xticks(rotation=15)
@@ -268,12 +368,7 @@ def chart_weak_scaling(p3: list[dict], out_path: Path) -> None:
 
 
 def chart_bounce_depth(abl: list[dict], out_path: Path) -> None:
-    """Mrays/s vs --max-depth.
-
-    Expected shape: drops sharply from depth 1 -> 4 (light not yet found),
-    then plateaus from depth 6+ thanks to RR. The plateau is the whole
-    point — RR makes the cap cosmetic.
-    """
+    """Mrays/s vs --max-depth (ablation)."""
     if not abl:
         print("WARN: no ablation data; skipping bounce_depth", file=sys.stderr)
         return
@@ -305,7 +400,11 @@ def chart_bounce_depth(abl: list[dict], out_path: Path) -> None:
 
     res = rows[0].get("resolution", "?")
     spp = rows[0].get("spp", "?")
-    fig.suptitle(f"Bounce-depth ablation @ {res}, {spp} spp\nRussian Roulette (depth>4) makes deeper caps nearly free", fontsize=12)
+    fig.suptitle(
+        f"Bounce-depth ablation @ {res}, {spp} spp\n"
+        "Russian Roulette (depth>4) makes deeper caps nearly free",
+        fontsize=12,
+    )
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -321,7 +420,6 @@ def chart_memory_4k(ext: list[dict], phase2_peak_gb: float, out_path: Path) -> N
         print("WARN: no 4K rows with peak_mb in extended timings; skipping memory_4k", file=sys.stderr)
         return
 
-    # Sort by spp
     rows_4k = sorted(rows_4k, key=lambda r: r["spp"])
     labels = [f"4K\n{r['spp']} spp" for r in rows_4k]
     peaks_gb = [r["peak_mb"] / 1024.0 for r in rows_4k]
@@ -340,7 +438,6 @@ def chart_memory_4k(ext: list[dict], phase2_peak_gb: float, out_path: Path) -> N
         ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.2f} GB",
                 ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-    # y-axis min 0 and a bit above the phase 2 reference
     ax.set_ylim(0, max(phase2_peak_gb * 1.1, max(peaks_gb) * 1.5 + 0.5))
 
     plt.tight_layout()
@@ -355,6 +452,8 @@ def chart_memory_4k(ext: list[dict], phase2_peak_gb: float, out_path: Path) -> N
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Build phase 3 deck charts.")
+    p.add_argument("--phase0-csv",  type=Path, default=None,
+                   help="Phase 0 CPU thread-scaling timings.csv (optional)")
     p.add_argument("--phase1-csv",  type=Path, default=None,
                    help="Phase 1 cu-smallpt timings.csv (optional)")
     p.add_argument("--phase2-csv",  type=Path, default=None,
@@ -372,20 +471,22 @@ def main() -> int:
     p.add_argument("--headline-spp", type=int, default=256,
                    help="Headline spp for the bar chart (default 256)")
     p.add_argument("--phase2-peak-gb", type=float, default=18.0,
-                   help="Phase 2 single-launch peak GB at 4K (default 18.0 from the v2 plan)")
+                   help="Phase 2 single-launch peak GB at 4K (default 18.0)")
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    p0  = read_phase0_timings(args.phase0_csv)
     p1  = read_timings(args.phase1_csv)
     p2  = read_timings(args.phase2_csv)
     p3  = read_timings(args.phase3_csv)
     ext = read_ext_timings(args.phase3_ext)
     abl = read_ablation(args.ablation_csv)
 
-    print(f"Loaded: phase1={len(p1)} phase2={len(p2)} phase3={len(p3)} ext={len(ext)} abl={len(abl)}")
+    print(f"Loaded: phase0={len(p0)} phase1={len(p1)} phase2={len(p2)} phase3={len(p3)} ext={len(ext)} abl={len(abl)}")
 
-    chart_mrays_bar(p1, p2, p3, args.headline_res, args.headline_spp,
+    chart_thread_scaling(p0, args.out_dir / "thread_scaling.png")
+    chart_mrays_bar(p0, p1, p2, p3, args.headline_res, args.headline_spp,
                     args.out_dir / "mrays_bar.png")
     chart_weak_scaling(p3, args.out_dir / "weak_scaling.png")
     chart_bounce_depth(abl, args.out_dir / "bounce_depth.png")

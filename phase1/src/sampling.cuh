@@ -14,26 +14,26 @@
 //-----------------------------------------------------------------------------
 namespace smallpt {
 
-	__device__ inline Vector3 UniformSampleOnHemisphere(double u1, 
-														double u2) {
+	__device__ inline Vector3 UniformSampleOnHemisphere(float u1,
+	                                                    float u2) {
 		// u1 := cos_theta
-		const double sin_theta = std::sqrt(fmax(0.0, 1.0 - u1 * u1));
-		const double phi = 2.0 * g_pi * u2;
+		const float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - u1 * u1));
+		const float phi = 2.0f * g_pi * u2;
 		return {
-			std::cos(phi) * sin_theta,
-			std::sin(phi) * sin_theta,
+			cosf(phi) * sin_theta,
+			sinf(phi) * sin_theta,
 			u1
 		};
 	}
 
-	__device__ inline Vector3 CosineWeightedSampleOnHemisphere(double u1, 
-															   double u2) {
-		const double cos_theta = sqrt(1.0 - u1);
-		const double sin_theta = sqrt(u1);
-		const double phi = 2.0 * g_pi * u2;
+	__device__ inline Vector3 CosineWeightedSampleOnHemisphere(float u1,
+	                                                           float u2) {
+		const float cos_theta = sqrtf(1.0f - u1);
+		const float sin_theta = sqrtf(u1);
+		const float phi = 2.0f * g_pi * u2;
 		return {
-			std::cos(phi) * sin_theta,
-			std::sin(phi) * sin_theta,
+			cosf(phi) * sin_theta,
+			sinf(phi) * sin_theta,
 			cos_theta
 		};
 	}

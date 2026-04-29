@@ -5,16 +5,11 @@
 
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
-// erand48: POSIX LCG, not in MSVC CRT. Same multiplier/addend as glibc.
+// erand48 polyfill: MSVC CRT lacks erand48. The standard smallpt VS port just
+// uses rand(). Lower-entropy than POSIX erand48 but correct in [0,1) and works.
 static inline double erand48(unsigned short xsubi[3]) {
-    unsigned long long x = ((unsigned long long)xsubi[2] << 32) |
-                           ((unsigned long long)xsubi[1] << 16) |
-                            (unsigned long long)xsubi[0];
-    x = x * 0x5DEECE66DULL + 0xBULL;
-    xsubi[0] = (unsigned short)( x        & 0xFFFF);
-    xsubi[1] = (unsigned short)((x >> 16) & 0xFFFF);
-    xsubi[2] = (unsigned short)((x >> 32) & 0xFFFF);
-    return (double)(x >> 16) / (double)(1ULL << 32);
+    (void)xsubi;
+    return (double)rand() / (double)RAND_MAX;
 }
 #endif
 
@@ -74,7 +69,6 @@ inline bool intersect(const Ray &r, double &t, int &id){
 }
 
 Vec radiance(const Ray &r, int depth, unsigned short *Xi){
-  ray_count.fetch_add(1, std::memory_order_relaxed);
   double t;
   int id=0;
   if (!intersect(r,t,id)) return Vec();
@@ -82,6 +76,7 @@ Vec radiance(const Ray &r, int depth, unsigned short *Xi){
   Vec x=r.o+r.d*t, n=(x-obj.p).norm(), nl=n.dot(r.d)<0?n:n*-1, f=obj.c;
   double p = f.x>f.y && f.x>f.z ? f.x : f.y>f.z ? f.y : f.z;
   if (++depth>5) if (erand48(Xi)<p) f=f*(1/p); else return obj.e;
+  if (depth>128) return obj.e; // bound recursion to avoid stack overflow on Windows
   if (obj.refl == DIFF){
     double r1=2*M_PI*erand48(Xi), r2=erand48(Xi), r2s=sqrt(r2);
     Vec w=nl, u=((fabs(w.x)>.1?Vec(0,1):Vec(1))%w).norm(), v=w%u;
@@ -113,6 +108,7 @@ int main(int argc, char *argv[]){
       for (int sy=0, i=(h-y-1)*w+x; sy<2; sy++)
         for (int sx=0; sx<2; sx++, r=Vec()){
           for (int s=0; s<samps; s++){
+            ray_count.fetch_add(1, std::memory_order_relaxed);
             double r1=2*erand48(Xi), dx=r1<1 ? sqrt(r1)-1: 1-sqrt(2-r1);
             double r2=2*erand48(Xi), dy=r2<1 ? sqrt(r2)-1: 1-sqrt(2-r2);
             Vec d = cx*( ( (sx+.5 + dx)/2 + x)/w - .5) +

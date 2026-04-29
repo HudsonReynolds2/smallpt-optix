@@ -22,11 +22,11 @@ namespace smallpt {
 		// Constructors and Destructors
 		//---------------------------------------------------------------------
 
-		__device__ explicit Ray(Vector3 o, 
-								Vector3 d, 
-								double tmin = 0.0, 
-								double tmax = std::numeric_limits< double >::infinity(), 
-								std::uint32_t depth = 0u) noexcept
+		__device__ explicit Ray(Vector3 o,
+		                        Vector3 d,
+		                        float tmin = 0.0f,
+		                        float tmax = std::numeric_limits< float >::infinity(),
+		                        std::uint32_t depth = 0u) noexcept
 			: m_o(std::move(o)),
 			m_d(std::move(d)),
 			m_tmin(tmin),
@@ -47,7 +47,7 @@ namespace smallpt {
 		// Member Methods
 		//---------------------------------------------------------------------
 
-		__device__ const Vector3 operator()(double t) const {
+		__device__ const Vector3 operator()(float t) const {
 			return m_o + m_d * t;
 		}
 
@@ -56,7 +56,7 @@ namespace smallpt {
 		//---------------------------------------------------------------------
 
 		Vector3 m_o, m_d;
-		mutable double m_tmin, m_tmax;
+		mutable float m_tmin, m_tmax;
 		std::uint32_t m_depth;
 	};
 }
