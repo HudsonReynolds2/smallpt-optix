@@ -30,7 +30,7 @@
 //
 // This is a standard fp32 path tracer epsilon. PBRT, Embree, and Mitsuba
 // all use scene-relative epsilons in this neighborhood for fp32 paths.
-#define EPSILON_SPHERE 1e-1f
+#define EPSILON_SPHERE  8e-2f  //1e-1f
 
 #pragma endregion
 
