@@ -338,25 +338,78 @@ foreach ($cfg in $Configs) {
     }
 
     if (-not $SkipPng) {
-        if (Test-Path $ppmPath) {
-            $pyCmd = "from PIL import Image; Image.open(r'$ppmPath').save(r'$pngPath')"
-            $pyCmdEscaped = $pyCmd.Replace('"', '\"')
-            & cmd.exe /c "python -c `"$pyCmdEscaped`" >NUL 2>NUL"
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  PNG: $pngPath" -ForegroundColor Green
-            } else {
-                Write-Host "  PNG conversion failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
-                $failures += @{ Config = $name; Reason = "PNG conversion exit $LASTEXITCODE" }
-            }
-        } else {
+        if (-not (Test-Path $ppmPath)) {
             Write-Host "  WARN: PPM not produced at $ppmPath" -ForegroundColor Yellow
             $failures += @{ Config = $name; Reason = "PPM not produced" }
         }
+        # PNG conversion is deferred to a batch step after all configs run.
+        # Doing it per-config was costing 28-120s per 4K config from
+        # Python+Pillow cold-start + Windows Defender scanning the
+        # freshly-written ~75MB ASCII PPM. That made wall times unreliable
+        # for the timings.csv schema. Now: kernel runs, PPM is written,
+        # script moves on to next config. PNGs all happen at the end in
+        # one persistent Python process.
     }
 
     $cfgElapsed = (Get-Date) - $cfgStart
     Write-Host ("  Wall time: {0:N1}s" -f $cfgElapsed.TotalSeconds)
     Write-Host ""
+}
+
+# -----------------------------------------------------------------------------
+# Batch PNG conversion (deferred so it doesn't pollute per-config wall times)
+# -----------------------------------------------------------------------------
+if (-not $SkipPng) {
+    Write-Host ""
+    Write-Host "=== Batch PNG conversion ===" -ForegroundColor Cyan
+    $pngStart = Get-Date
+
+    # Find every PPM under RendersDir and convert to a sibling PNG in one
+    # persistent Python process. Avoids per-config Pillow cold-start and
+    # lets Windows Defender scan everything in one pass instead of N.
+    $ppmFiles = Get-ChildItem -Path $RendersDir -Filter *.ppm -ErrorAction SilentlyContinue
+    if ($ppmFiles.Count -eq 0) {
+        Write-Host "  No PPM files found in $RendersDir" -ForegroundColor Yellow
+    } else {
+        # Build a newline-separated PPM path list and pipe it to a Python
+        # one-liner that converts each to PNG. Persistent process means
+        # Pillow is imported exactly once.
+        $listPath = Join-Path $RunDir "ppm_list.txt"
+        $ppmFiles | ForEach-Object { $_.FullName } | Out-File -FilePath $listPath -Encoding ascii
+
+        $pyScript = @"
+import sys
+from PIL import Image
+ok, fail = 0, 0
+with open(sys.argv[1], 'r') as f:
+    for line in f:
+        ppm = line.strip()
+        if not ppm:
+            continue
+        png = ppm[:-4] + '.png' if ppm.lower().endswith('.ppm') else ppm + '.png'
+        try:
+            Image.open(ppm).save(png)
+            print('OK  ' + png)
+            ok += 1
+        except Exception as e:
+            print('ERR ' + ppm + ' :: ' + str(e))
+            fail += 1
+print('---')
+print('Converted: %d ok, %d failed' % (ok, fail))
+sys.exit(0 if fail == 0 else 1)
+"@
+        $pyScriptPath = Join-Path $RunDir "convert_ppms.py"
+        $pyScript | Out-File -FilePath $pyScriptPath -Encoding ascii
+
+        & python $pyScriptPath $listPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  Some PNG conversions failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
+            $failures += @{ Config = "png_batch"; Reason = "PNG batch exit $LASTEXITCODE" }
+        }
+        Remove-Item $listPath -ErrorAction SilentlyContinue
+    }
+    $pngElapsed = (Get-Date) - $pngStart
+    Write-Host ("PNG batch wall time: {0:N1}s" -f $pngElapsed.TotalSeconds)
 }
 
 # -----------------------------------------------------------------------------
