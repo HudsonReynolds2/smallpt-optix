@@ -60,7 +60,22 @@ namespace smallpt {
             }
 
             const Sphere& shape = dev_spheres[id];
-            const Vector3 p = r(r.m_tmax);
+
+            // Fix D: reconstruct the hit point from the sphere center plus
+            // the unnormalized normal (which has magnitude exactly r).
+            //
+            // The textbook form `p = ray.m_o + t * ray.m_d` is fine in
+            // fp64 but in fp32 it suffers when t ~ 1e5: the result is
+            // quantized to ~1mm steps, and that quantization shows up as
+            // low-amplitude banding on the back wall and ceiling.
+            //
+            // Since n_unnorm = p - shape.m_p with |n_unnorm| = r exactly
+            // (by construction in Sphere::Intersect), `p = m_p + n_unnorm`
+            // reproduces the same mathematical hit point but with the
+            // large-scale add happening between two operands of similar
+            // magnitude (~1e5 + ~1e5 cancellation-free for addition,
+            // unlike the multiply-then-add which loses bits in t).
+            const Vector3 p = shape.m_p + n_unnorm;
             // Fix C: normal comes from Intersect, which built it from
             // bounded-magnitude quantities (sqrtD * d - perp). The old code
             // was `Normalize(p - shape.m_p)` which subtracts two ~1e5

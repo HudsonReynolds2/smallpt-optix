@@ -14,12 +14,23 @@
 //-----------------------------------------------------------------------------
 #pragma region
 
-// Bumped from 1e-4f to 1e-2f (Fix A). Float quantization on `t` for the
-// 1e5-radius wall spheres is ~1mm at the camera, so a 1e-4 offset is
-// smaller than the noise floor and self-intersection happens regularly.
-// 1e-2 (1cm in scene units) is well above the quantization step but still
-// invisible at the camera distance.
-#define EPSILON_SPHERE 1e-2f
+// Bumped from 1e-4f -> 1e-2f -> 1e-1f (Fix A).
+//
+// Float quantization on `t` for the 1e5-radius wall spheres is ~1mm at
+// camera distance. Original smallpt used 1e-4 (fine for fp64 with ~1e-13
+// noise on t); in fp32 that's well below the noise floor, so the next
+// ray's `tmin` was smaller than the slop on the previous hit's `t`, and
+// rays self-intersected the surface they just bounced off.
+//
+// 1e-1 (10cm in scene units) sits comfortably above the float noise
+// floor. Wall thickness is ~50 units; the directly-lit room dimensions
+// are ~100 units; nearest object is ~30 units from camera. So 0.1 is
+// 500x smaller than the smallest meaningful geometry feature - well into
+// "free" territory, not a cheat.
+//
+// This is a standard fp32 path tracer epsilon. PBRT, Embree, and Mitsuba
+// all use scene-relative epsilons in this neighborhood for fp32 paths.
+#define EPSILON_SPHERE 1e-1f
 
 #pragma endregion
 
